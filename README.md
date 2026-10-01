@@ -1,11 +1,12 @@
 # vet_flow — Sistema Distribuído de Mensagens (Clínica Veterinária)
 
-> **Status atual do projeto: Parte 1 completa.**
+> **Status atual do projeto: Parte 1 completa e dockerizada.**
 > Login, criação e listagem de canais, com persistência em disco, em
 > **Python e Java**. Interoperabilidade entre as duas linguagens
-> confirmada nos dois sentidos, para os três tipos de mensagem. Este
-> README documenta apenas o que já existe — não descreve funcionalidades
-> futuras como já implementadas.
+> confirmada nos dois sentidos, para os três tipos de mensagem — inclusive
+> via `docker compose up`, sem interação manual. Este README documenta
+> apenas o que já existe — não descreve funcionalidades futuras como já
+> implementadas.
 
 ## Objetivo
 
@@ -212,13 +213,32 @@ java -jar target\vetflow-client.jar
 
 ## Docker
 
-O projeto **exige** Docker/Podman + Docker Compose para a execução final
-(conforme o enunciado), mas isso ainda não foi implementado — os testes
-até aqui rodaram apenas localmente, sem containers, para simplificar o
-desenvolvimento incremental. `Dockerfile`s e `docker-compose.yml` serão
-adicionados no próximo passo do roteiro.
+```bash
+docker compose up --build
+```
+
+**Validado de ponta a ponta** (build limpo, sem dados residuais): sobe
+`python-server` e `java-server` (ficam de pé) e roda 6 bots
+automaticamente, sem nenhuma interação manual — login nas 4 combinações
+de linguagem, mais um canal criado por um bot Java no servidor Python e
+listado de volta por um bot Python. Todos os containers de bot terminam
+com `exit code 0`.
+
+Dados persistem em `python/server/data/` e `java/server/data/` no host
+(bind mount), sobrevivendo a `docker compose down`.
+
+**Nota:** como os dados sobrevivem no host, rodar a demonstração de novo
+sem limpar os dados vai fazer o `bot-channel-create` falhar com
+`canal já existe` (comportamento correto — é a regra de duplicidade
+funcionando). Para rodar do zero:
+
+```powershell
+docker compose down
+Remove-Item -Force .\python\server\data\*.msgpack -ErrorAction SilentlyContinue
+Remove-Item -Force .\java\server\data\*.msgpack -ErrorAction SilentlyContinue
+docker compose up --build
+```
 
 ## Próximos passos
 
-1. Dockerização da Parte 1 (Dockerfiles + docker-compose.yml para os 4 processos).
-2. Parte 2 (Pub/Sub + broker).
+1. Parte 2 (Pub/Sub + broker).

@@ -32,7 +32,7 @@ CHANNEL_NAME = os.environ.get("CHANNEL_NAME", "avisos-gerais")
 # servidor nao responda. Importante porque o projeto nao pode depender de
 # interacao manual (regra do enunciado) -- o bot precisa poder desistir
 # sozinho e sinalizar erro via exit code.
-RECV_TIMEOUT_MS = 5000
+RECV_TIMEOUT_MS = int(os.environ.get("RECV_TIMEOUT_MS", "5000"))
 
 
 def build_envelope(msg_type: str, payload: dict) -> dict:

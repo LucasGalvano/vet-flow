@@ -1,0 +1,94 @@
+# Orquestracao da Parte 1: 2 servidores (Python e Java) + bots que
+# demonstram login e canais, incluindo interoperabilidade cruzada entre
+# as duas linguagens -- tudo automatico, sem interacao manual.
+#
+# Rede: criada implicitamente pelo Compose (todos os servicos se
+# enxergam pelo nome do servico como hostname).
+
+services:
+  python-server:
+    build: ./python/server
+    ports:
+      - "5555:5555"
+    volumes:
+      - ./python/server/data:/app/data
+
+  java-server:
+    build: ./java/server
+    ports:
+      - "5556:5555"
+    volumes:
+      - ./java/server/data:/app/data
+
+  # --- Demonstracao de LOGIN, nas 4 combinacoes de linguagem ---
+
+  bot-login-py-to-py:
+    build: ./python/client
+    environment:
+      SERVER_ADDRESS: tcp://python-server:5555
+      BOT_NAME: bot-python-to-python
+      ACTION: LOGIN
+      RECV_TIMEOUT_MS: "15000"
+    depends_on:
+      python-server:
+        condition: service_started
+
+  bot-login-java-to-java:
+    build: ./java/client
+    environment:
+      SERVER_ADDRESS: tcp://java-server:5555
+      BOT_NAME: bot-java-to-java
+      ACTION: LOGIN
+      RECV_TIMEOUT_MS: "15000"
+    depends_on:
+      java-server:
+        condition: service_started
+
+  bot-login-py-to-java:
+    build: ./python/client
+    environment:
+      SERVER_ADDRESS: tcp://java-server:5555
+      BOT_NAME: bot-python-to-java
+      ACTION: LOGIN
+      RECV_TIMEOUT_MS: "15000"
+    depends_on:
+      java-server:
+        condition: service_started
+
+  bot-login-java-to-py:
+    build: ./java/client
+    environment:
+      SERVER_ADDRESS: tcp://python-server:5555
+      BOT_NAME: bot-java-to-python
+      ACTION: LOGIN
+      RECV_TIMEOUT_MS: "15000"
+    depends_on:
+      python-server:
+        condition: service_started
+
+  # --- Demonstracao de canal criado por uma linguagem e lido pela outra ---
+
+  bot-channel-create:
+    build: ./java/client
+    environment:
+      SERVER_ADDRESS: tcp://python-server:5555
+      BOT_NAME: bot-java-cria-canal
+      ACTION: CHANNEL_CREATE
+      CHANNEL_NAME: cirurgias
+      RECV_TIMEOUT_MS: "15000"
+    depends_on:
+      python-server:
+        condition: service_started
+
+  bot-channel-list:
+    build: ./python/client
+    environment:
+      SERVER_ADDRESS: tcp://python-server:5555
+      BOT_NAME: bot-python-lista-canais
+      ACTION: CHANNEL_LIST
+      RECV_TIMEOUT_MS: "15000"
+    depends_on:
+      # Espera o bot acima TERMINAR com sucesso antes de listar, para
+      # garantir (sem sleep arbitrario) que o canal ja foi criado.
+      bot-channel-create:
+        condition: service_completed_successfully

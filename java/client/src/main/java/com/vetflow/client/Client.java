@@ -39,7 +39,8 @@ public class Client {
     // caso o servidor nao responda. Importante porque o projeto nao pode
     // depender de interacao manual -- o bot precisa poder desistir
     // sozinho e sinalizar erro via exit code.
-    private static final int RECV_TIMEOUT_MS = 5000;
+    private static final int RECV_TIMEOUT_MS =
+            Integer.parseInt(System.getenv().getOrDefault("RECV_TIMEOUT_MS", "5000"));
 
     public static void main(String[] args) {
         try (ZContext ctx = new ZContext()) {
