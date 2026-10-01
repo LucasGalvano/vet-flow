@@ -1,10 +1,11 @@
 # vet_flow — Sistema Distribuído de Mensagens (Clínica Veterinária)
 
-> **Status atual do projeto: Parte 1, em andamento.**
-> Implementado até aqui: login, criação e listagem de canais, todos com
-> persistência em disco — **apenas em Python**. Este README documenta
-> apenas o que já existe — não descreve funcionalidades futuras como já
-> implementadas.
+> **Status atual do projeto: Parte 1 completa.**
+> Login, criação e listagem de canais, com persistência em disco, em
+> **Python e Java**. Interoperabilidade entre as duas linguagens
+> confirmada nos dois sentidos, para os três tipos de mensagem. Este
+> README documenta apenas o que já existe — não descreve funcionalidades
+> futuras como já implementadas.
 
 ## Objetivo
 
@@ -31,15 +32,18 @@ O contrato de mensagens comum entre Python e Java está documentado em
 [`protocol/PROTOCOL.md`](protocol/PROTOCOL.md) e é atualizado conforme cada
 parte é implementada.
 
-## O que já está implementado (Parte 1)
+## O que já está implementado (Parte 1 — completa)
 
-- `python/server`: servidor ZeroMQ (`REP`) que trata `LOGIN_REQUEST`,
-  `CHANNEL_CREATE_REQUEST` e `CHANNEL_LIST_REQUEST`, com persistência em
-  disco (MessagePack) para logins e canais.
-- `python/client`: bot ZeroMQ (`REQ`) que envia uma dessas requisições por
-  execução, escolhida via variável `ACTION`.
-- Nome de canal duplicado é rejeitado com erro.
-- Sem implementação Java ainda.
+- `python/server` e `java/server`: servidor ZeroMQ (`REP`) que trata
+  `LOGIN_REQUEST`, `CHANNEL_CREATE_REQUEST` e `CHANNEL_LIST_REQUEST`, com
+  persistência em disco (MessagePack) para logins e canais.
+- `python/client` e `java/client`: bot ZeroMQ (`REQ`) que envia uma dessas
+  requisições por execução, escolhida via variável `ACTION`.
+- Nome de canal duplicado é rejeitado com erro (ambas as linguagens).
+- **Interoperabilidade Python ↔ Java confirmada** nos dois sentidos, para
+  os três tipos de mensagem — incluindo o caso mais importante: um canal
+  criado por um bot Java, persistido por um servidor Python, lido de
+  volta corretamente por um client Python.
 
 ## Estrutura de diretórios
 
@@ -53,13 +57,37 @@ projeto/
 ├── python/
 │   ├── server/
 │   │   ├── server.py
+│   │   ├── persistence.py
 │   │   └── requirements.txt
 │   └── client/
 │       ├── client.py
 │       └── requirements.txt
 └── java/
-    ├── server/             # ainda vazio — implementação futura
-    └── client/             # ainda vazio — implementação futura
+    ├── server/
+    │   ├── pom.xml
+    │   └── src/main/java/com/vetflow/server/
+    │       ├── Server.java
+    │       └── Persistence.java
+    └── client/
+        ├── pom.xml
+        └── src/main/java/com/vetflow/client/
+            └── Client.java
+```
+
+## Dependências (Java)
+
+- JDK 17+ (`java -version` para conferir)
+- Maven 3.6+ (`mvn -version` para conferir)
+- Dependências gerenciadas pelo Maven (baixadas do Maven Central
+  automaticamente no `mvn package`):
+  - [JeroMQ](https://github.com/zeromq/jeromq) — implementação ZeroMQ em Java puro
+  - [jackson-dataformat-msgpack](https://github.com/msgpack/msgpack-java) — serialização MessagePack
+
+Build:
+
+```bash
+cd java/server && mvn package   # gera target/vetflow-server.jar
+cd java/client && mvn package   # gera target/vetflow-client.jar
 ```
 
 ## Dependências (Python)
@@ -132,17 +160,65 @@ Saída esperada de `ACTION=CHANNEL_LIST`:
 [CLIENT] Canais existentes (1): ['vacinas']
 ```
 
+## Como testar: Java Client ↔ Java Server
+
+**Terminal 1 — subir o servidor Java:**
+
+```powershell
+cd java\server
+mvn package
+java -jar target\vetflow-server.jar
+```
+
+Como o Python Server já pode estar rodando na porta 5555, use outra porta
+para o Java enquanto testamos localmente sem Docker:
+
+```powershell
+$env:SERVER_BIND_ADDRESS="tcp://*:5556"
+java -jar target\vetflow-server.jar
+```
+
+**Terminal 2 — rodar o client Java:**
+
+```powershell
+cd java\client
+mvn package
+$env:SERVER_ADDRESS="tcp://localhost:5556"; $env:BOT_NAME="bot-java-1"; $env:ACTION="LOGIN"
+java -jar target\vetflow-client.jar
+```
+
+## Como testar: interoperabilidade Python ↔ Java
+
+**Confirmado funcionando** para `LOGIN`, `CHANNEL_CREATE` e `CHANNEL_LIST`,
+nos dois sentidos.
+
+Com o Java Server rodando na porta 5556 (acima), rode o **client Python**
+apontando para ele:
+
+```powershell
+cd python\client
+$env:SERVER_ADDRESS="tcp://localhost:5556"; $env:BOT_NAME="dra-ana-vet"; $env:ACTION="LOGIN"
+python client.py
+```
+
+E, com o Python Server rodando na porta 5555 (padrão), rode o **client
+Java** apontando para ele:
+
+```powershell
+cd java\client
+$env:SERVER_ADDRESS="tcp://localhost:5555"; $env:BOT_NAME="bot-java-1"; $env:ACTION="LOGIN"
+java -jar target\vetflow-client.jar
+```
+
 ## Docker
 
 O projeto **exige** Docker/Podman + Docker Compose para a execução final
-(conforme o enunciado), mas isso ainda não foi implementado — o passo atual
-roda apenas localmente, sem containers, para simplificar o desenvolvimento
-incremental. `Dockerfile`s e `docker-compose.yml` serão adicionados quando
-o projeto atingir esse ponto do roteiro.
+(conforme o enunciado), mas isso ainda não foi implementado — os testes
+até aqui rodaram apenas localmente, sem containers, para simplificar o
+desenvolvimento incremental. `Dockerfile`s e `docker-compose.yml` serão
+adicionados no próximo passo do roteiro.
 
 ## Próximos passos
 
-1. Implementação Java equivalente (server + client): login, canais, persistência.
-2. Teste de interoperabilidade Python ↔ Java.
-3. Dockerização (Parte 1 completa).
-4. Parte 2 (Pub/Sub + broker).
+1. Dockerização da Parte 1 (Dockerfiles + docker-compose.yml para os 4 processos).
+2. Parte 2 (Pub/Sub + broker).

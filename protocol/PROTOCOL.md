@@ -54,10 +54,17 @@ enunciado.
 
 ### Status desta etapa
 
-Implementado até aqui, em Python: **`LOGIN_REQUEST`/`LOGIN_RESPONSE`**,
-**`CHANNEL_CREATE_REQUEST`/`CHANNEL_CREATE_RESPONSE`** e
-**`CHANNEL_LIST_REQUEST`/`CHANNEL_LIST_RESPONSE`**, com persistência em
-disco (MessagePack) para logins e canais. Java ainda não implementado.
+**Parte 1 completa e validada em Python e Java**: `LOGIN_REQUEST`/`LOGIN_RESPONSE`,
+`CHANNEL_CREATE_REQUEST`/`CHANNEL_CREATE_RESPONSE` e
+`CHANNEL_LIST_REQUEST`/`CHANNEL_LIST_RESPONSE`, com persistência em disco
+(MessagePack) para logins e canais.
+
+Interoperabilidade confirmada nos dois sentidos, para os três tipos de
+mensagem: Python client ↔ Python server, Java client ↔ Java server,
+Python client ↔ Java server, Java client ↔ Python server. Testado
+inclusive o caso mais importante: um canal criado por um bot Java,
+persistido por um servidor Python, e lido de volta corretamente por um
+client Python.
 
 Nome de canal duplicado é tratado como erro (`status: ERROR`), comparação
 exata case-sensitive — decisão de implementação, não especificada pelo
