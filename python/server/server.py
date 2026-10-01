@@ -96,6 +96,7 @@ def handle_channel_create_request(envelope: dict) -> dict:
         )
 
     # Nome duplicado e tratado como erro (comparacao exata, case-sensitive).
+    # [DECISAO DE IMPLEMENTACAO] -- o enunciado nao especifica esse caso.
     global known_channels
     already_exists = any(
         c.get("channel_name") == channel_name for c in known_channels
@@ -143,7 +144,7 @@ def dispatch(envelope: dict) -> dict:
     # Tipo desconhecido nao deve derrubar o servidor (REP exige sempre 1
     # send() por recv(), senao o socket trava em estado inconsistente).
     return build_envelope(
-        "LOGIN_RESPONSE",
+        "ERROR_RESPONSE",
         {"status": "ERROR", "error_msg": f"tipo de mensagem desconhecido: {msg_type}"},
     )
 
@@ -165,10 +166,27 @@ def main():
     try:
         while True:
             raw = socket.recv()
-            envelope = msgpack.unpackb(raw, raw=False)
-            print(f"[RECV] {envelope}")
 
-            response = dispatch(envelope)
+            # Cada mensagem e tratada isoladamente: qualquer falha ao
+            # decodificar o MessagePack, ou ao processar o envelope
+            # (campos ausentes, tipos inesperados, envelope que nao e um
+            # dict, etc.), e capturada aqui e vira um ERROR_RESPONSE, em
+            # vez de propagar e derrubar o servidor inteiro. O socket REP
+            # exige exatamente 1 send() por recv(), entao SEMPRE
+            # respondemos algo, mesmo em erro.
+            try:
+                envelope = msgpack.unpackb(raw, raw=False)
+                print(f"[RECV] {envelope}")
+                response = dispatch(envelope)
+            except Exception as e:
+                print(f"[ERROR] Falha ao processar mensagem: {e}")
+                response = build_envelope(
+                    "ERROR_RESPONSE",
+                    {
+                        "status": "ERROR",
+                        "error_msg": f"mensagem invalida ou mal-formada: {e}",
+                    },
+                )
 
             socket.send(msgpack.packb(response, use_bin_type=True))
             print(f"[SEND] {response}")

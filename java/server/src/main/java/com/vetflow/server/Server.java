@@ -62,11 +62,25 @@ public class Server {
                     continue;
                 }
 
-                @SuppressWarnings("unchecked")
-                Map<String, Object> envelope = MAPPER.readValue(raw, Map.class);
-                System.out.println("[RECV] " + envelope);
-
-                Map<String, Object> response = dispatch(envelope);
+                // Cada mensagem e tratada isoladamente: qualquer falha ao
+                // decodificar o MessagePack, ou ao processar o envelope
+                // (campos ausentes, tipos inesperados, envelope que nao e
+                // um Map, etc.), e capturada aqui e vira um
+                // ERROR_RESPONSE, em vez de propagar e encerrar o
+                // servidor. O socket REP exige exatamente 1 send() por
+                // recv(), entao SEMPRE respondemos algo, mesmo em erro.
+                Map<String, Object> response;
+                try {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> envelope = MAPPER.readValue(raw, Map.class);
+                    System.out.println("[RECV] " + envelope);
+                    response = dispatch(envelope);
+                } catch (Exception e) {
+                    System.err.println("[ERROR] Falha ao processar mensagem: " + e.getMessage());
+                    response = errorResponse(
+                            "ERROR_RESPONSE",
+                            "mensagem invalida ou mal-formada: " + e.getMessage());
+                }
 
                 byte[] out = MAPPER.writeValueAsBytes(response);
                 socket.send(out, 0);
