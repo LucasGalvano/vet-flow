@@ -117,9 +117,7 @@ public class Server {
 
         // Tipo desconhecido nao deve derrubar o servidor (REP exige sempre
         // 1 send() por recv(), senao o socket trava em estado inconsistente).
-        // Mesma decisao pre-existente do lado Python: usa LOGIN_RESPONSE
-        // como tipo de fallback (ponto ja registrado para revisao futura).
-        return errorResponse("LOGIN_RESPONSE", "tipo de mensagem desconhecido: " + type);
+        return errorResponse("ERROR_RESPONSE", "tipo de mensagem desconhecido: " + type);
     }
 
     @SuppressWarnings("unchecked")

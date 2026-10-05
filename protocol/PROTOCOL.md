@@ -51,6 +51,17 @@ enunciado.
 | `CHANNEL_CREATE_RESPONSE` | Server → Client | `{ "status": ..., "error_msg"?: string }` |
 | `CHANNEL_LIST_REQUEST` | Client → Server | `{}` |
 | `CHANNEL_LIST_RESPONSE` | Server → Client | `{ "channels": [string] }` |
+| `ERROR_RESPONSE` | Server → Client | `{ "status": "ERROR", "error_msg": string }` |
+
+`ERROR_RESPONSE` é devolvido quando o servidor não consegue nem
+identificar o tipo da requisição — mensagem MessagePack malformada/truncada,
+envelope com `type` desconhecido ou ausente, ou campos com tipo
+estruturalmente incompatível (ex.: `payload` não é um mapa). Não deve ser
+confundido com os `*_RESPONSE` de erro específicos de cada operação (ex.:
+`LOGIN_RESPONSE` com `status: ERROR` para `bot_name` ausente), que seguem
+sendo usados quando o tipo da requisição foi identificado corretamente mas
+um campo esperado está ausente/inválido dentro do fluxo normal daquela
+operação.
 
 ### Status desta etapa
 
@@ -65,6 +76,12 @@ Python client ↔ Java server, Java client ↔ Python server. Testado
 inclusive o caso mais importante: um canal criado por um bot Java,
 persistido por um servidor Python, e lido de volta corretamente por um
 client Python.
+
+Robustez validada: mensagens MessagePack malformadas, truncadas, com
+`payload`/envelope de tipo estruturalmente incorreto, ou `type`
+desconhecido, **não derrubam mais o servidor** — cada mensagem é tratada
+isoladamente e qualquer falha de decodificação/processamento vira um
+`ERROR_RESPONSE`, mantendo o servidor no ar (corrigido em Python e Java).
 
 Nome de canal duplicado é tratado como erro (`status: ERROR`), comparação
 exata case-sensitive — decisão de implementação, não especificada pelo
