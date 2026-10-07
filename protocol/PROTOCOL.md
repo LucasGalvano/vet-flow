@@ -94,5 +94,59 @@ enunciado.
 | Python Server | 5555 | REP |
 | Java Server | 5555 (container próprio) | REP |
 
-Reservado para partes futuras (não usado ainda): 5557 (XSUB) / 5558 (XPUB)
-para o broker Pub/Sub da Parte 2.
+## Parte 2 — Pub/Sub
+
+### Portas
+
+| Serviço | Porta | Socket |
+|---|---|---|
+| Broker — lado publishers (servidores) | 5557 | `XSUB` (bind) |
+| Broker — lado subscribers (clients) | 5558 | `XPUB` (bind) |
+
+Fluxo: `Servers --PUB--> [XSUB broker XPUB] --SUB--> Clients`. O broker
+(`broker/broker.py`) não tem lógica de negócio — só `zmq.proxy()`.
+
+### Framing (multipart)
+
+Cada mensagem Pub/Sub é enviada como **2 frames**:
+
+1. **Frame 1 (tópico)**: `channel_name` em UTF-8 puro (ex.: `b"vacinas"`).
+   Este é o mecanismo de **roteamento** do ZeroMQ (o broker filtra por
+   prefixo de bytes neste frame) — **não é o conteúdo da mensagem**, e
+   não precisa (nem deve) ser MessagePack.
+2. **Frame 2 (envelope)**: o envelope completo, serializado em
+   MessagePack, igual ao padrão REQ/REP da Parte 1.
+
+⚠️ **Limitação conhecida, não corrigida**: o ZeroMQ faz *prefix match* no
+tópico, não igualdade exata. Um subscriber de `"vac"` também receberia
+mensagens de um canal `"vacinas"`. Aceitável neste projeto desde que os
+nomes de canal não compartilhem prefixos ambíguos.
+
+### Tipos de mensagem
+
+| type | Direção | payload |
+|---|---|---|
+| `PUBLISH_REQUEST` | Client → Server (REQ/REP) | `{ "channel_name": string, "message": string }` |
+| `PUBLISH_RESPONSE` | Server → Client (REQ/REP) | `{ "status": ..., "error_msg"?: string }` |
+| `CHANNEL_MESSAGE` | Server → Broker → Client (PUB/SUB) | `{ "channel_name": string, "message": string }` |
+
+`PUBLISH_REQUEST` exige que o canal já exista (criado via
+`CHANNEL_CREATE_REQUEST` na Parte 1); publicar em canal inexistente
+retorna `ERROR`.
+
+### Ordem persistência → publicação
+
+O servidor **persiste a mensagem em disco primeiro, só depois publica**
+no broker (nunca o inverso). Motivo: durabilidade antes de visibilidade —
+se a publicação falhar (ex.: broker fora do ar), a mensagem não se perde,
+só não chega a um subscriber ao vivo naquele instante (não há
+replay/catch-up nesta etapa).
+
+### Status desta etapa
+
+**Implementado e testado em Python** (servidor + client reais, ponta a
+ponta): `PUBLISH_REQUEST`/`PUBLISH_RESPONSE` via REQ/REP, persistência em
+`messages.msgpack`, publicação no broker, e `ACTION=SUBSCRIBE` do client
+recebendo a mensagem em tempo real via `SUB` direto no broker. Validado
+também o caso de erro (publicar em canal inexistente). Java ainda não
+implementado para a Parte 2.

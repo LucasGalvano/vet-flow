@@ -30,12 +30,22 @@ LOGINS_PATH = os.environ.get(
 CHANNELS_PATH = os.environ.get(
     "CHANNELS_PERSISTENCE_PATH", persistence.DEFAULT_CHANNELS_PATH
 )
+MESSAGES_PATH = os.environ.get(
+    "MESSAGES_PERSISTENCE_PATH", persistence.DEFAULT_MESSAGES_PATH
+)
+
+# Endereco do XSUB do broker (Parte 2) -- o servidor conecta um socket
+# PUB nele para publicar mensagens. Processo separado, ver broker/broker.py.
+BROKER_XSUB_ADDRESS = os.environ.get("BROKER_XSUB_ADDRESS", "tcp://localhost:5557")
 
 # Estado em memoria, carregado do disco ao iniciar. Seguro sem lock
 # porque o loop principal (main) processa uma requisicao REP por vez,
 # sequencialmente -- ver nota de concorrencia em persistence.py.
 known_logins = []
 known_channels = []
+
+# Socket PUB global, criado em main() e usado pelo handler de PUBLISH_REQUEST.
+pub_socket = None
 
 
 def build_envelope(msg_type: str, payload: dict) -> dict:
@@ -128,6 +138,56 @@ def handle_channel_list_request(envelope: dict) -> dict:
     return build_envelope("CHANNEL_LIST_RESPONSE", {"channels": channel_names})
 
 
+def handle_publish_request(envelope: dict) -> dict:
+    """Trata PUBLISH_REQUEST: valida canal, persiste e so entao publica
+    no broker (ver ordem persistencia->publicacao documentada em
+    protocol/PROTOCOL.md). Devolve PUBLISH_RESPONSE via REQ/REP."""
+    payload = envelope.get("payload") or {}
+    channel_name = payload.get("channel_name")
+    message = payload.get("message")
+
+    if not channel_name:
+        return build_envelope(
+            "PUBLISH_RESPONSE",
+            {"status": "ERROR", "error_msg": "campo 'channel_name' ausente ou vazio"},
+        )
+    if not message:
+        return build_envelope(
+            "PUBLISH_RESPONSE",
+            {"status": "ERROR", "error_msg": "campo 'message' ausente ou vazio"},
+        )
+
+    channel_exists = any(c.get("channel_name") == channel_name for c in known_channels)
+    if not channel_exists:
+        return build_envelope(
+            "PUBLISH_RESPONSE",
+            {"status": "ERROR", "error_msg": f"canal '{channel_name}' nao existe"},
+        )
+
+    record = {
+        "channel_name": channel_name,
+        "sender_id": envelope.get("sender_id"),
+        "sender_lang": envelope.get("sender_lang"),
+        "message": message,
+        "timestamp": envelope.get("timestamp"),
+    }
+    # 1) Persiste primeiro (durabilidade antes de visibilidade).
+    persistence.append_message(record, MESSAGES_PATH)
+
+    # 2) So entao publica no broker, para subscribers ao vivo.
+    publish_envelope = build_envelope(
+        "CHANNEL_MESSAGE", {"channel_name": channel_name, "message": message}
+    )
+    topic = channel_name.encode("utf-8")
+    body = msgpack.packb(publish_envelope, use_bin_type=True)
+    if pub_socket is not None:
+        pub_socket.send_multipart([topic, body])
+
+    print(f"[PUBLISH] channel='{channel_name}' message='{message}'")
+
+    return build_envelope("PUBLISH_RESPONSE", {"status": "OK"})
+
+
 def dispatch(envelope: dict) -> dict:
     """Roteia o envelope recebido para o handler correto pelo campo 'type'."""
     msg_type = envelope.get("type")
@@ -141,6 +201,9 @@ def dispatch(envelope: dict) -> dict:
     if msg_type == "CHANNEL_LIST_REQUEST":
         return handle_channel_list_request(envelope)
 
+    if msg_type == "PUBLISH_REQUEST":
+        return handle_publish_request(envelope)
+
     # Tipo desconhecido nao deve derrubar o servidor (REP exige sempre 1
     # send() por recv(), senao o socket trava em estado inconsistente).
     return build_envelope(
@@ -150,18 +213,26 @@ def dispatch(envelope: dict) -> dict:
 
 
 def main():
-    global known_logins, known_channels
+    global known_logins, known_channels, pub_socket
     known_logins = persistence.load_logins(LOGINS_PATH)
     known_channels = persistence.load_channels(CHANNELS_PATH)
+    known_messages = persistence.load_messages(MESSAGES_PATH)
     print(
-        f"[SERVER] Historico carregado: {len(known_logins)} login(s) e "
-        f"{len(known_channels)} canal(is) previamente persistido(s)"
+        f"[SERVER] Historico carregado: {len(known_logins)} login(s), "
+        f"{len(known_channels)} canal(is) e {len(known_messages)} "
+        f"mensagem(ns) previamente persistido(s)"
     )
 
     context = zmq.Context()
     socket = context.socket(zmq.REP)
     socket.bind(BIND_ADDRESS)
     print(f"[SERVER] Python Server (REP) ouvindo em {BIND_ADDRESS}")
+
+    # PUB conectado ao broker (Parte 2). "connect", nao "bind": quem faz
+    # bind e o broker (XSUB), o servidor so se conecta nele.
+    pub_socket = context.socket(zmq.PUB)
+    pub_socket.connect(BROKER_XSUB_ADDRESS)
+    print(f"[SERVER] PUB conectado ao broker em {BROKER_XSUB_ADDRESS}")
 
     try:
         while True:
@@ -194,6 +265,7 @@ def main():
         print("\n[SERVER] Encerrando...")
     finally:
         socket.close()
+        pub_socket.close()
         context.term()
 
 

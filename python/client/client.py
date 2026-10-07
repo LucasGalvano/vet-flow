@@ -1,17 +1,16 @@
 """
-Python Client (bot) - Parte 1 (passo 3)
+Python Client (bot) - Parte 1 + Parte 2
 
-Escopo DESTE passo:
-    - Socket ZeroMQ REQ, conforme especificado no enunciado.
-    - Envia UMA requisicao por execucao, definida por ACTION:
-        ACTION=LOGIN           -> LOGIN_REQUEST
-        ACTION=CHANNEL_CREATE  -> CHANNEL_CREATE_REQUEST
-        ACTION=CHANNEL_LIST    -> CHANNEL_LIST_REQUEST
-    - Exibe a resposta recebida.
+Escopo:
+    - ACTION=LOGIN / CHANNEL_CREATE / CHANNEL_LIST / PUBLISH:
+      socket ZeroMQ REQ contra o servidor (Parte 1 + PUBLISH_REQUEST).
+    - ACTION=SUBSCRIBE: socket ZeroMQ SUB conectado DIRETO no broker
+      (Parte 2), nao no servidor -- escuta por SUBSCRIBE_SECONDS e sai.
 
 O client eh um bot: nao ha nenhuma interacao manual. Nome do bot,
-endereco do servidor e a acao a executar vem de variaveis de ambiente
-(facilita configurar via Docker Compose futuramente, sem mudar codigo).
+endereco do servidor/broker e a acao a executar vem de variaveis de
+ambiente (facilita configurar via Docker Compose futuramente, sem mudar
+codigo).
 
 Ver contrato completo em protocol/PROTOCOL.md.
 """
@@ -24,9 +23,12 @@ import msgpack
 import zmq
 
 SERVER_ADDRESS = os.environ.get("SERVER_ADDRESS", "tcp://localhost:5555")
+BROKER_ADDRESS = os.environ.get("BROKER_ADDRESS", "tcp://localhost:5558")
 BOT_NAME = os.environ.get("BOT_NAME", "bot-python-1")
 ACTION = os.environ.get("ACTION", "LOGIN").upper()
 CHANNEL_NAME = os.environ.get("CHANNEL_NAME", "avisos-gerais")
+MESSAGE = os.environ.get("MESSAGE", "mensagem de teste")
+SUBSCRIBE_SECONDS = float(os.environ.get("SUBSCRIBE_SECONDS", "5"))
 
 # Timeout de recepcao: evita que o bot fique bloqueado para sempre caso o
 # servidor nao responda. Importante porque o projeto nao pode depender de
@@ -59,6 +61,12 @@ def build_request() -> dict:
     if ACTION == "CHANNEL_LIST":
         return build_envelope("CHANNEL_LIST_REQUEST", {})
 
+    if ACTION == "PUBLISH":
+        return build_envelope(
+            "PUBLISH_REQUEST",
+            {"channel_name": CHANNEL_NAME, "message": MESSAGE},
+        )
+
     print(f"[CLIENT] ACTION desconhecida: '{ACTION}'")
     sys.exit(1)
 
@@ -83,7 +91,43 @@ def print_result(response: dict) -> None:
         sys.exit(1)
 
 
+def run_subscribe():
+    """ACTION=SUBSCRIBE: conecta direto no broker (nao no servidor),
+    assina CHANNEL_NAME e escuta por SUBSCRIBE_SECONDS antes de sair.
+    Fluxo totalmente separado do REQ/REP usado pelas outras acoes."""
+    context = zmq.Context()
+    sub = context.socket(zmq.SUB)
+    sub.connect(BROKER_ADDRESS)
+    sub.setsockopt(zmq.SUBSCRIBE, CHANNEL_NAME.encode("utf-8"))
+    sub.setsockopt(zmq.RCVTIMEO, 500)
+    print(
+        f"[CLIENT] '{BOT_NAME}' assinando canal '{CHANNEL_NAME}' em "
+        f"{BROKER_ADDRESS} por {SUBSCRIBE_SECONDS}s"
+    )
+
+    received = []
+    deadline = time.time() + SUBSCRIBE_SECONDS
+    try:
+        while time.time() < deadline:
+            try:
+                topic, body = sub.recv_multipart()
+                envelope = msgpack.unpackb(body, raw=False)
+                print(f"[RECV] topico={topic.decode()} envelope={envelope}")
+                received.append(envelope)
+            except zmq.error.Again:
+                continue
+    finally:
+        sub.close()
+        context.term()
+
+    print(f"[CLIENT] total de mensagens recebidas: {len(received)}")
+
+
 def main():
+    if ACTION == "SUBSCRIBE":
+        run_subscribe()
+        return
+
     context = zmq.Context()
     socket = context.socket(zmq.REQ)
     socket.setsockopt(zmq.RCVTIMEO, RECV_TIMEOUT_MS)

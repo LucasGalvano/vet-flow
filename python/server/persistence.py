@@ -33,6 +33,7 @@ import msgpack
 DEFAULT_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 DEFAULT_LOGINS_PATH = os.path.join(DEFAULT_DATA_DIR, "logins.msgpack")
 DEFAULT_CHANNELS_PATH = os.path.join(DEFAULT_DATA_DIR, "channels.msgpack")
+DEFAULT_MESSAGES_PATH = os.path.join(DEFAULT_DATA_DIR, "messages.msgpack")
 
 
 def _ensure_parent_dir(path: str) -> None:
@@ -121,4 +122,20 @@ def save_channels(channels: list, path: str = DEFAULT_CHANNELS_PATH) -> None:
 
 
 def append_channel(record: dict, path: str = DEFAULT_CHANNELS_PATH) -> list:
+    return _append_item(record, path)
+
+
+# ---------------------------------------------------------------------
+# Messages (Parte 2 -- mensagens publicadas em canais)
+# ---------------------------------------------------------------------
+
+def load_messages(path: str = DEFAULT_MESSAGES_PATH) -> list:
+    return _load_list(path)
+
+
+def save_messages(messages: list, path: str = DEFAULT_MESSAGES_PATH) -> None:
+    _save_list(messages, path)
+
+
+def append_message(record: dict, path: str = DEFAULT_MESSAGES_PATH) -> list:
     return _append_item(record, path)
