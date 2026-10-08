@@ -1,24 +1,43 @@
-# Orquestracao da Parte 1: 2 servidores (Python e Java) + bots que
-# demonstram login e canais, incluindo interoperabilidade cruzada entre
-# as duas linguagens -- tudo automatico, sem interacao manual.
+# Orquestracao das Partes 1 e 2: 2 servidores (Python e Java), broker
+# Pub/Sub e bots que demonstram login, canais e publicacao/assinatura,
+# incluindo interoperabilidade cruzada entre as duas linguagens -- tudo
+# automatico, sem interacao manual.
 #
 # Rede: criada implicitamente pelo Compose (todos os servicos se
 # enxergam pelo nome do servico como hostname).
 
 services:
+  # Broker Pub/Sub (Parte 2): XSUB 5557 (servidores publicam) e XPUB 5558
+  # (clients assinam). Processo separado, sem logica de negocio.
+  broker:
+    build: ./broker
+    ports:
+      - "5557:5557"
+      - "5558:5558"
+
   python-server:
     build: ./python/server
+    environment:
+      BROKER_XSUB_ADDRESS: tcp://broker:5557
     ports:
       - "5555:5555"
     volumes:
       - ./python/server/data:/app/data
+    depends_on:
+      broker:
+        condition: service_started
 
   java-server:
     build: ./java/server
+    environment:
+      BROKER_XSUB_ADDRESS: tcp://broker:5557
     ports:
       - "5556:5555"
     volumes:
       - ./java/server/data:/app/data
+    depends_on:
+      broker:
+        condition: service_started
 
   # --- Demonstracao de LOGIN, nas 4 combinacoes de linguagem ---
 
@@ -91,4 +110,90 @@ services:
       # Espera o bot acima TERMINAR com sucesso antes de listar, para
       # garantir (sem sleep arbitrario) que o canal ja foi criado.
       bot-channel-create:
+        condition: service_completed_successfully
+
+  # --- Parte 2: Pub/Sub via broker ---
+  # Canal 'avisos-clinica' criado nos DOIS servidores; um publisher em
+  # cada um; dois subscribers (Python e Java) escutando o broker. Cada
+  # subscriber deve receber as DUAS mensagens (uma publicada pelo
+  # servidor Python, outra pelo servidor Java).
+
+  bot-ps-create-on-pyserver:
+    build: ./java/client
+    environment:
+      SERVER_ADDRESS: tcp://python-server:5555
+      BOT_NAME: bot-java-cria-canal-no-python
+      ACTION: CHANNEL_CREATE
+      CHANNEL_NAME: avisos-clinica
+      RECV_TIMEOUT_MS: "15000"
+    depends_on:
+      python-server:
+        condition: service_started
+
+  bot-ps-create-on-javaserver:
+    build: ./python/client
+    environment:
+      SERVER_ADDRESS: tcp://java-server:5555
+      BOT_NAME: bot-python-cria-canal-no-java
+      ACTION: CHANNEL_CREATE
+      CHANNEL_NAME: avisos-clinica
+      RECV_TIMEOUT_MS: "15000"
+    depends_on:
+      java-server:
+        condition: service_started
+
+  bot-ps-subscriber-py:
+    build: ./python/client
+    environment:
+      BROKER_ADDRESS: tcp://broker:5558
+      BOT_NAME: subscriber-python
+      ACTION: SUBSCRIBE
+      CHANNEL_NAME: avisos-clinica
+      SUBSCRIBE_SECONDS: "25"
+    depends_on:
+      broker:
+        condition: service_started
+
+  bot-ps-subscriber-java:
+    build: ./java/client
+    environment:
+      BROKER_ADDRESS: tcp://broker:5558
+      BOT_NAME: subscriber-java
+      ACTION: SUBSCRIBE
+      CHANNEL_NAME: avisos-clinica
+      SUBSCRIBE_SECONDS: "25"
+    depends_on:
+      broker:
+        condition: service_started
+
+  # Publishers: esperam o canal ser criado (service_completed_successfully)
+  # E um atraso fixo antes de publicar. O atraso existe porque o Pub/Sub do
+  # ZeroMQ nao tem sinal de "assinatura ativa" (slow joiner): sem ele, a
+  # mensagem poderia sair antes do subscriber Java (JVM) terminar de assinar.
+  bot-ps-publish-pyserver:
+    build: ./python/client
+    command: ["sh", "-c", "sleep 8 && python client.py"]
+    environment:
+      SERVER_ADDRESS: tcp://python-server:5555
+      BOT_NAME: bot-python-publica-no-python
+      ACTION: PUBLISH
+      CHANNEL_NAME: avisos-clinica
+      MESSAGE: "Dra. Ana registrou vacina antirrabica com validade ate 2027-01-01 (via servidor Python)"
+      RECV_TIMEOUT_MS: "15000"
+    depends_on:
+      bot-ps-create-on-pyserver:
+        condition: service_completed_successfully
+
+  bot-ps-publish-javaserver:
+    build: ./java/client
+    command: ["sh", "-c", "sleep 8 && java -jar vetflow-client.jar"]
+    environment:
+      SERVER_ADDRESS: tcp://java-server:5555
+      BOT_NAME: bot-java-publica-no-java
+      ACTION: PUBLISH
+      CHANNEL_NAME: avisos-clinica
+      MESSAGE: "Recepcionista Joana registrou a limpeza da clinica as 08:00 (via servidor Java)"
+      RECV_TIMEOUT_MS: "15000"
+    depends_on:
+      bot-ps-create-on-javaserver:
         condition: service_completed_successfully

@@ -1,11 +1,12 @@
 # vet_flow — Sistema Distribuído de Mensagens (Clínica Veterinária)
 
-> **Status atual do projeto: Parte 1 completa e dockerizada.**
-> Login, criação e listagem de canais, com persistência em disco, em
-> **Python e Java**. Interoperabilidade entre as duas linguagens
-> confirmada nos dois sentidos, para os três tipos de mensagem — inclusive
-> via `docker compose up`, sem interação manual. Este README documenta
-> apenas o que já existe — não descreve funcionalidades futuras como já
+> **Status atual do projeto: Partes 1 e 2 completas e dockerizadas.**
+> Parte 1: login, criação e listagem de canais, com persistência em disco.
+> Parte 2: Pub/Sub via broker (`XSUB` 5557 / `XPUB` 5558), com persistência
+> das mensagens publicadas. Ambas em **Python e Java**, com
+> interoperabilidade confirmada nos dois sentidos, inclusive via
+> `docker compose up`, sem interação manual. Este README documenta apenas
+> o que já existe — não descreve funcionalidades futuras como já
 > implementadas.
 
 ## Objetivo
@@ -45,6 +46,24 @@ parte é implementada.
   os três tipos de mensagem — incluindo o caso mais importante: um canal
   criado por um bot Java, persistido por um servidor Python, lido de
   volta corretamente por um client Python.
+
+## O que já está implementado (Parte 2 — Pub/Sub)
+
+- `broker/`: proxy `XSUB` (5557) / `XPUB` (5558) em Python, sem lógica de
+  negócio (`zmq.proxy`).
+- Servidores (Python e Java): `PUBLISH_REQUEST` via REQ/REP → valida que o
+  canal existe → **persiste** em `messages.msgpack` → **só então publica**
+  no broker (durabilidade antes de visibilidade).
+- Clients (Python e Java): `ACTION=PUBLISH` e `ACTION=SUBSCRIBE`
+  (`SUB` direto no broker, escuta por `SUBSCRIBE_SECONDS` e sai).
+- Framing: multipart — frame 1 = tópico (nome do canal, UTF-8, mecanismo de
+  roteamento), frame 2 = envelope completo em MessagePack. Ver
+  [`protocol/PROTOCOL.md`](protocol/PROTOCOL.md).
+- Interoperabilidade Pub/Sub testada manualmente: Python→Python,
+  Java→Java, servidor Python→subscriber Java e servidor Java→subscriber
+  Python.
+- Limitação conhecida: o ZeroMQ faz *prefix match* no tópico (um subscriber
+  de `vac` também recebe `vacinas`).
 
 ## Estrutura de diretórios
 
@@ -113,11 +132,16 @@ obrigatória — todas têm valor padrão seguro no código.
 |---|---|---|---|
 | `BOT_NAME` | client | `bot-python-1` | Nome do bot que faz login / cria canais |
 | `SERVER_ADDRESS` | client | `tcp://localhost:5555` | Endereço do servidor |
-| `ACTION` | client | `LOGIN` | Ação a executar: `LOGIN`, `CHANNEL_CREATE` ou `CHANNEL_LIST` |
+| `ACTION` | client | `LOGIN` | Ação a executar: `LOGIN`, `CHANNEL_CREATE`, `CHANNEL_LIST`, `PUBLISH` ou `SUBSCRIBE` |
 | `CHANNEL_NAME` | client | `avisos-gerais` | Nome do canal, usado quando `ACTION=CHANNEL_CREATE` |
 | `SERVER_BIND_ADDRESS` | server | `tcp://*:5555` | Endereço de bind do servidor |
 | `LOGINS_PERSISTENCE_PATH` | server | `python/server/data/logins.msgpack` | Caminho do arquivo de persistência de logins |
 | `CHANNELS_PERSISTENCE_PATH` | server | `python/server/data/channels.msgpack` | Caminho do arquivo de persistência de canais |
+| `MESSAGES_PERSISTENCE_PATH` | server | `python/server/data/messages.msgpack` | Caminho do arquivo de persistência de mensagens publicadas |
+| `BROKER_XSUB_ADDRESS` | server | `tcp://localhost:5557` | Endereço do `XSUB` do broker, onde o servidor conecta seu `PUB` |
+| `BROKER_ADDRESS` | client | `tcp://localhost:5558` | Endereço do `XPUB` do broker, usado em `ACTION=SUBSCRIBE` |
+| `MESSAGE` | client | `mensagem de teste` | Texto publicado em `ACTION=PUBLISH` |
+| `SUBSCRIBE_SECONDS` | client | `5` | Por quanto tempo `ACTION=SUBSCRIBE` escuta antes de sair |
 
 O projeto **não** usa `python-dotenv` — as variáveis são lidas diretamente
 via `os.environ.get(...)`. Para usá-las, exporte-as no shell antes de rodar
@@ -239,6 +263,26 @@ Remove-Item -Force .\java\server\data\*.msgpack -ErrorAction SilentlyContinue
 docker compose up --build
 ```
 
+### Parte 2 no Docker (validado)
+
+O `docker-compose.yml` também sobe o `broker` e 6 bots de Pub/Sub: o canal
+`avisos-clinica` é criado nos dois servidores, um publisher em cada servidor
+publica uma mensagem, e dois subscribers (Python e Java) escutam o broker.
+**Validado:** cada subscriber recebeu as duas mensagens (uma de cada
+servidor) e todos os bots terminaram com `exit code 0`.
+
+Os publishers esperam 8s antes de publicar (`sleep` no `command` do
+compose): o Pub/Sub do ZeroMQ não tem sinal de "assinatura ativa" (*slow
+joiner*), e sem esse atraso a mensagem poderia sair antes do subscriber
+Java terminar de assinar. Em máquinas mais lentas, se um subscriber vier com
+menos mensagens, aumente esse valor.
+
+O aviso de dados antigos vale aqui também: se o canal `avisos-clinica` já
+existir nos dados persistidos, o bot de criação falha e os publishers não
+rodam. Limpe os `*.msgpack` conforme descrito acima antes de rodar de novo.
+
 ## Próximos passos
 
-1. Parte 2 (Pub/Sub + broker).
+1. Bateria de robustez da Parte 2 (mensagens malformadas no `PUBLISH`,
+   restart preservando `messages.msgpack`).
+2. Parte 3 (relógios lógicos, heartbeat, Reference Service).

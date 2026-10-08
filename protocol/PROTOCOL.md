@@ -150,10 +150,18 @@ ponta): `PUBLISH_REQUEST`/`PUBLISH_RESPONSE` via REQ/REP, persistência em
 recebendo a mensagem em tempo real via `SUB` direto no broker. Validado
 também o caso de erro (publicar em canal inexistente).
 
-**Implementado em Java, ainda não compilado/testado** (mesma limitação de
-ambiente já registrada na Parte 1 — sem acesso ao Maven Central no
-sandbox onde este código foi escrito): `PUB` socket conectado ao broker,
-handler `PUBLISH_REQUEST` espelhando o Python, e `ACTION=PUBLISH`/
-`ACTION=SUBSCRIBE` no client. Pendente validação local e teste de
-interoperabilidade cruzada (ex.: servidor Python publica, subscriber Java
-recebe).
+**Implementado e testado em Java** (Java client + Java server + broker,
+ponta a ponta): `PUB` socket conectado ao broker, handler
+`PUBLISH_REQUEST` espelhando o Python, `ACTION=PUBLISH` e
+`ACTION=SUBSCRIBE` no client. Subscriber Java recebeu a mensagem em tempo
+real e a persistência em `messages.msgpack` foi confirmada no restart.
+
+**Interoperabilidade cruzada Pub/Sub confirmada** nos dois sentidos:
+servidor Python → subscriber Java e servidor Java → subscriber Python
+(multipart do JeroMQ + envelope do Jackson decodificados corretamente
+pelo `SUB` em Python, e vice-versa).
+
+**Docker validado:** `broker/Dockerfile` e os serviços/bots de Pub/Sub no
+`docker-compose.yml` rodaram com `docker compose up --build`. Dois
+subscribers (Python e Java) receberam, cada um, as duas mensagens
+publicadas por servidores de linguagens diferentes no mesmo tópico. 
