@@ -148,5 +148,12 @@ replay/catch-up nesta etapa).
 ponta): `PUBLISH_REQUEST`/`PUBLISH_RESPONSE` via REQ/REP, persistência em
 `messages.msgpack`, publicação no broker, e `ACTION=SUBSCRIBE` do client
 recebendo a mensagem em tempo real via `SUB` direto no broker. Validado
-também o caso de erro (publicar em canal inexistente). Java ainda não
-implementado para a Parte 2.
+também o caso de erro (publicar em canal inexistente).
+
+**Implementado em Java, ainda não compilado/testado** (mesma limitação de
+ambiente já registrada na Parte 1 — sem acesso ao Maven Central no
+sandbox onde este código foi escrito): `PUB` socket conectado ao broker,
+handler `PUBLISH_REQUEST` espelhando o Python, e `ACTION=PUBLISH`/
+`ACTION=SUBSCRIBE` no client. Pendente validação local e teste de
+interoperabilidade cruzada (ex.: servidor Python publica, subscriber Java
+recebe).

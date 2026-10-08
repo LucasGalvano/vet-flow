@@ -38,6 +38,7 @@ public class Persistence {
     public static final String DEFAULT_DATA_DIR = "data";
     public static final String DEFAULT_LOGINS_PATH = DEFAULT_DATA_DIR + File.separator + "logins.msgpack";
     public static final String DEFAULT_CHANNELS_PATH = DEFAULT_DATA_DIR + File.separator + "channels.msgpack";
+    public static final String DEFAULT_MESSAGES_PATH = DEFAULT_DATA_DIR + File.separator + "messages.msgpack";
 
     @SuppressWarnings("unchecked")
     public static List<Map<String, Object>> loadList(String path) {

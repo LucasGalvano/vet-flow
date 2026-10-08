@@ -38,23 +38,42 @@ public class Server {
     private static final String CHANNELS_PATH =
             System.getenv().getOrDefault("CHANNELS_PERSISTENCE_PATH", Persistence.DEFAULT_CHANNELS_PATH);
 
+    private static final String MESSAGES_PATH =
+            System.getenv().getOrDefault("MESSAGES_PERSISTENCE_PATH", Persistence.DEFAULT_MESSAGES_PATH);
+
+    // Endereco do XSUB do broker (Parte 2) -- o servidor conecta um
+    // socket PUB nele para publicar mensagens. Processo separado, ver
+    // broker/broker.py.
+    private static final String BROKER_XSUB_ADDRESS =
+            System.getenv().getOrDefault("BROKER_XSUB_ADDRESS", "tcp://localhost:5557");
+
     // Estado em memoria, seguro sem lock porque o loop principal processa
     // uma requisicao REP por vez, sequencialmente (mesma premissa do
     // server Python -- ver nota em Persistence.java).
     private static List<Map<String, Object>> knownLogins = new ArrayList<>();
     private static List<Map<String, Object>> knownChannels = new ArrayList<>();
 
+    // Socket PUB, criado em main() e usado pelo handler de PUBLISH_REQUEST.
+    private static ZMQ.Socket pubSocket;
+
     public static void main(String[] args) {
         knownLogins = Persistence.loadList(LOGINS_PATH);
         knownChannels = Persistence.loadList(CHANNELS_PATH);
+        List<Map<String, Object>> knownMessages = Persistence.loadList(MESSAGES_PATH);
         System.out.printf(
-                "[SERVER] Historico carregado: %d login(s) e %d canal(is) previamente persistido(s)%n",
-                knownLogins.size(), knownChannels.size());
+                "[SERVER] Historico carregado: %d login(s), %d canal(is) e %d mensagem(ns) previamente persistido(s)%n",
+                knownLogins.size(), knownChannels.size(), knownMessages.size());
 
         try (ZContext ctx = new ZContext()) {
             ZMQ.Socket socket = ctx.createSocket(SocketType.REP);
             socket.bind(BIND_ADDRESS);
             System.out.println("[SERVER] Java Server (REP) ouvindo em " + BIND_ADDRESS);
+
+            // PUB conectado ao broker (Parte 2). "connect", nao "bind":
+            // quem faz bind e o broker (XSUB), o servidor so se conecta.
+            pubSocket = ctx.createSocket(SocketType.PUB);
+            pubSocket.connect(BROKER_XSUB_ADDRESS);
+            System.out.println("[SERVER] PUB conectado ao broker em " + BROKER_XSUB_ADDRESS);
 
             while (!Thread.currentThread().isInterrupted()) {
                 byte[] raw = socket.recv(0);
@@ -113,6 +132,9 @@ public class Server {
         }
         if ("CHANNEL_LIST_REQUEST".equals(type)) {
             return handleChannelListRequest();
+        }
+        if ("PUBLISH_REQUEST".equals(type)) {
+            return handlePublishRequest(envelope);
         }
 
         // Tipo desconhecido nao deve derrubar o servidor (REP exige sempre
@@ -184,6 +206,59 @@ public class Server {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("channels", channelNames);
         return buildEnvelope("CHANNEL_LIST_RESPONSE", payload);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> handlePublishRequest(Map<String, Object> envelope) {
+        Map<String, Object> payload = (Map<String, Object>) envelope.get("payload");
+        String channelName = stringOrNull(payload, "channel_name");
+        String message = stringOrNull(payload, "message");
+
+        if (channelName == null || channelName.isEmpty()) {
+            return errorResponse("PUBLISH_RESPONSE", "campo 'channel_name' ausente ou vazio");
+        }
+        if (message == null || message.isEmpty()) {
+            return errorResponse("PUBLISH_RESPONSE", "campo 'message' ausente ou vazio");
+        }
+
+        boolean channelExists = knownChannels.stream()
+                .anyMatch(c -> channelName.equals(c.get("channel_name")));
+        if (!channelExists) {
+            return errorResponse("PUBLISH_RESPONSE", "canal '" + channelName + "' nao existe");
+        }
+
+        Map<String, Object> record = new LinkedHashMap<>();
+        record.put("channel_name", channelName);
+        record.put("sender_id", envelope.get("sender_id"));
+        record.put("sender_lang", envelope.get("sender_lang"));
+        record.put("message", message);
+        record.put("timestamp", envelope.get("timestamp"));
+
+        // 1) Persiste primeiro (durabilidade antes de visibilidade --
+        // ver ordem documentada em protocol/PROTOCOL.md).
+        Persistence.appendItem(record, MESSAGES_PATH);
+
+        // 2) So entao publica no broker, para subscribers ao vivo.
+        Map<String, Object> publishPayload = new LinkedHashMap<>();
+        publishPayload.put("channel_name", channelName);
+        publishPayload.put("message", message);
+        Map<String, Object> publishEnvelope = buildEnvelope("CHANNEL_MESSAGE", publishPayload);
+
+        try {
+            byte[] topic = channelName.getBytes("UTF-8");
+            byte[] body = MAPPER.writeValueAsBytes(publishEnvelope);
+            pubSocket.sendMore(topic);
+            pubSocket.send(body, 0);
+        } catch (Exception e) {
+            // Nao deve acontecer em condicoes normais; se acontecer, a
+            // mensagem ja esta persistida (passo 1), entao nao perdemos
+            // dado -- so o subscriber ao vivo que nao recebe.
+            System.err.println("[ERROR] Falha ao publicar no broker: " + e.getMessage());
+        }
+
+        System.out.printf("[PUBLISH] channel='%s' message='%s'%n", channelName, message);
+
+        return okResponse("PUBLISH_RESPONSE");
     }
 
     private static String stringOrNull(Map<String, Object> payload, String key) {
