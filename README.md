@@ -74,6 +74,8 @@ projeto/
 ├── README.md
 ├── protocol/
 │   └── PROTOCOL.md        # contrato comum de mensagens Python <-> Java
+├── tests/
+│   └── test_publish_validation.py   # contrato do PUBLISH_REQUEST (qualquer servidor)
 ├── python/
 │   ├── server/
 │   │   ├── server.py
@@ -234,6 +236,30 @@ cd java\client
 $env:SERVER_ADDRESS="tcp://localhost:5555"; $env:BOT_NAME="bot-java-1"; $env:ACTION="LOGIN"
 java -jar target\vetflow-client.jar
 ```
+
+## Testes
+
+### Contrato de `PUBLISH_REQUEST` (Python e Java)
+
+`tests/test_publish_validation.py` fala só por sockets ZeroMQ, então o
+**mesmo script** testa o servidor Python ou o Java. Cobre string válida,
+número, booleano, lista, objeto, `null`, campo ausente e string vazia (mais
+variantes "falsy": `0`, `false`, `[]`, `{}`), e confere também que nada
+rejeitado foi **publicado** (um subscriber real escuta o canal) nem
+**persistido** (compara o número de registros em `messages.msgpack`).
+
+Com o broker e **um** servidor rodando (um de cada vez, ambos usam a 5555):
+
+```powershell
+# servidor Python
+python tests\test_publish_validation.py --server tcp://localhost:5555 --broker tcp://localhost:5558 --messages-file python\server\data\messages.msgpack
+
+# servidor Java
+python tests\test_publish_validation.py --server tcp://localhost:5555 --broker tcp://localhost:5558 --messages-file java\server\data\messages.msgpack
+```
+
+Sai com código 1 se algum caso falhar. Dependências: as mesmas do client
+Python (`pyzmq`, `msgpack`).
 
 ## Docker
 

@@ -211,15 +211,18 @@ public class Server {
     @SuppressWarnings("unchecked")
     private static Map<String, Object> handlePublishRequest(Map<String, Object> envelope) {
         Map<String, Object> payload = (Map<String, Object>) envelope.get("payload");
-        String channelName = stringOrNull(payload, "channel_name");
-        String message = stringOrNull(payload, "message");
 
-        if (channelName == null || channelName.isEmpty()) {
-            return errorResponse("PUBLISH_RESPONSE", "campo 'channel_name' ausente ou vazio");
+        // Nenhuma requisicao invalida chega a persistencia nem ao broker:
+        // toda validacao acontece antes do primeiro appendItem.
+        for (String field : new String[] {"channel_name", "message"}) {
+            String error = validateRequiredString(payload, field);
+            if (error != null) {
+                return errorResponse("PUBLISH_RESPONSE", error);
+            }
         }
-        if (message == null || message.isEmpty()) {
-            return errorResponse("PUBLISH_RESPONSE", "campo 'message' ausente ou vazio");
-        }
+
+        String channelName = (String) payload.get("channel_name");
+        String message = (String) payload.get("message");
 
         boolean channelExists = knownChannels.stream()
                 .anyMatch(c -> channelName.equals(c.get("channel_name")));
@@ -259,6 +262,28 @@ public class Server {
         System.out.printf("[PUBLISH] channel='%s' message='%s'%n", channelName, message);
 
         return okResponse("PUBLISH_RESPONSE");
+    }
+
+    /**
+     * Contrato de campo string obrigatorio (ver PROTOCOL.md, PUBLISH_REQUEST).
+     * Retorna null se valido, ou a mensagem de erro. SEM conversao implicita:
+     *   - ausente, null ou string vazia -> "campo 'X' ausente ou vazio"
+     *   - qualquer outro tipo (numero, booleano, lista, objeto) ->
+     *     "campo 'X' deve ser uma string"
+     * Mesmas mensagens e mesma ordem de verificacao do server.py.
+     */
+    private static String validateRequiredString(Map<String, Object> payload, String key) {
+        Object value = payload != null ? payload.get(key) : null;
+        if (value == null) {
+            return "campo '" + key + "' ausente ou vazio";
+        }
+        if (!(value instanceof String)) {
+            return "campo '" + key + "' deve ser uma string";
+        }
+        if (((String) value).isEmpty()) {
+            return "campo '" + key + "' ausente ou vazio";
+        }
+        return null;
     }
 
     private static String stringOrNull(Map<String, Object> payload, String key) {

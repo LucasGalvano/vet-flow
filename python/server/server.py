@@ -138,24 +138,44 @@ def handle_channel_list_request(envelope: dict) -> dict:
     return build_envelope("CHANNEL_LIST_RESPONSE", {"channels": channel_names})
 
 
+def validate_required_string(payload: dict, field: str):
+    """Contrato de campo string obrigatorio (ver PROTOCOL.md, PUBLISH_REQUEST).
+
+    Retorna None se valido, ou a mensagem de erro. SEM conversao implicita:
+      - ausente, null ou string vazia -> "campo 'X' ausente ou vazio"
+      - qualquer outro tipo (numero, booleano, lista, objeto) ->
+        "campo 'X' deve ser uma string"
+    O teste de tipo vem ANTES do teste de vazio de proposito: valores
+    "falsy" como 0, false, [] e {} sao do tipo errado, nao "vazios".
+    """
+    value = payload.get(field)
+    if value is None:
+        return f"campo '{field}' ausente ou vazio"
+    if not isinstance(value, str):
+        return f"campo '{field}' deve ser uma string"
+    if value == "":
+        return f"campo '{field}' ausente ou vazio"
+    return None
+
+
 def handle_publish_request(envelope: dict) -> dict:
     """Trata PUBLISH_REQUEST: valida canal, persiste e so entao publica
     no broker (ver ordem persistencia->publicacao documentada em
-    protocol/PROTOCOL.md). Devolve PUBLISH_RESPONSE via REQ/REP."""
-    payload = envelope.get("payload") or {}
-    channel_name = payload.get("channel_name")
-    message = payload.get("message")
+    protocol/PROTOCOL.md). Devolve PUBLISH_RESPONSE via REQ/REP.
 
-    if not channel_name:
-        return build_envelope(
-            "PUBLISH_RESPONSE",
-            {"status": "ERROR", "error_msg": "campo 'channel_name' ausente ou vazio"},
-        )
-    if not message:
-        return build_envelope(
-            "PUBLISH_RESPONSE",
-            {"status": "ERROR", "error_msg": "campo 'message' ausente ou vazio"},
-        )
+    Nenhuma requisicao invalida chega a persistencia nem ao broker: toda
+    validacao acontece antes do primeiro append_message."""
+    payload = envelope.get("payload") or {}
+
+    for field in ("channel_name", "message"):
+        error = validate_required_string(payload, field)
+        if error:
+            return build_envelope(
+                "PUBLISH_RESPONSE", {"status": "ERROR", "error_msg": error}
+            )
+
+    channel_name = payload["channel_name"]
+    message = payload["message"]
 
     channel_exists = any(c.get("channel_name") == channel_name for c in known_channels)
     if not channel_exists:
@@ -181,7 +201,14 @@ def handle_publish_request(envelope: dict) -> dict:
     topic = channel_name.encode("utf-8")
     body = msgpack.packb(publish_envelope, use_bin_type=True)
     if pub_socket is not None:
-        pub_socket.send_multipart([topic, body])
+        try:
+            pub_socket.send_multipart([topic, body])
+        except Exception as e:
+            # A mensagem JA esta persistida (passo 1), entao nao perdemos
+            # dado -- so o subscriber ao vivo que nao recebe. Devolver erro
+            # ao client aqui faria um retry gerar mensagem duplicada em
+            # disco. Mesmo comportamento do Server.java.
+            print(f"[ERROR] Falha ao publicar no broker: {e}")
 
     print(f"[PUBLISH] channel='{channel_name}' message='{message}'")
 

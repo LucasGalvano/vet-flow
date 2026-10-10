@@ -134,6 +134,35 @@ nomes de canal não compartilhem prefixos ambíguos.
 `CHANNEL_CREATE_REQUEST` na Parte 1); publicar em canal inexistente
 retorna `ERROR`.
 
+### Contrato de `PUBLISH_REQUEST` (campos e tipos)
+
+| Campo (`payload`) | Tipo | Obrigatório | Regra |
+|---|---|---|---|
+| `channel_name` | string | sim | não vazia; o canal precisa existir |
+| `message` | string | sim | não vazia |
+
+**Sem conversões implícitas.** O servidor não converte nenhum valor para
+texto: um campo só é aceito se já chegou como string MessagePack. Python e
+Java aplicam exatamente a mesma regra, na mesma ordem (`channel_name`
+primeiro, depois `message`; o primeiro erro encontrado é o devolvido):
+
+| Valor recebido no campo | Resultado |
+|---|---|
+| string não vazia | aceito |
+| campo ausente, `null` ou `""` | `ERROR`: `campo '<nome>' ausente ou vazio` |
+| número (inclusive `0`), booleano (inclusive `false`), lista, objeto/mapa (inclusive `[]` e `{}`) | `ERROR`: `campo '<nome>' deve ser uma string` |
+
+A checagem de tipo vem **antes** da de vazio: `0`, `false`, `[]` e `{}`
+são do tipo errado, não "vazios". Se o canal não existe, o erro é
+`canal '<nome>' nao existe`. As respostas de erro são `PUBLISH_RESPONSE`
+com `status: ERROR`; um `payload` que não é um mapa vira `ERROR_RESPONSE`
+(ver acima).
+
+**Requisição inválida não persiste nem publica:** toda validação acontece
+antes do primeiro `append` em `messages.msgpack` e antes do `PUB` no
+broker, então uma requisição rejeitada não deixa rastro em disco nem
+chega a subscribers.
+
 ### Ordem persistência → publicação
 
 O servidor **persiste a mensagem em disco primeiro, só depois publica**
@@ -141,6 +170,14 @@ no broker (nunca o inverso). Motivo: durabilidade antes de visibilidade —
 se a publicação falhar (ex.: broker fora do ar), a mensagem não se perde,
 só não chega a um subscriber ao vivo naquele instante (não há
 replay/catch-up nesta etapa).
+Por isso, uma falha ao publicar **depois** de persistir não é devolvida ao
+client como erro: o servidor registra o problema em log e responde
+`PUBLISH_RESPONSE` com `OK`, porque a mensagem está durável. Devolver erro
+aqui faria um retry do client gravar a mesma mensagem duas vezes
+(Python e Java têm o mesmo comportamento).
+
+Limitação conhecida: o `PUBLISH_RESPONSE OK` significa "persistido", não
+"entregue a subscribers".
 
 ### Status desta etapa
 
@@ -164,4 +201,4 @@ pelo `SUB` em Python, e vice-versa).
 **Docker validado:** `broker/Dockerfile` e os serviços/bots de Pub/Sub no
 `docker-compose.yml` rodaram com `docker compose up --build`. Dois
 subscribers (Python e Java) receberam, cada um, as duas mensagens
-publicadas por servidores de linguagens diferentes no mesmo tópico. 
+publicadas por servidores de linguagens diferentes no mesmo tópico.
