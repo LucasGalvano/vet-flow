@@ -1,0 +1,61 @@
+# =========================================================
+# Python
+# =========================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.python-version
+
+# =========================================================
+# Java (quando a implementacao Java existir)
+# =========================================================
+target/
+build/
+*.class
+*.jar
+*.war
+.gradle/
+
+# =========================================================
+# IDEs
+# =========================================================
+.idea/
+.vscode/
+*.iml
+.classpath
+.project
+.settings/
+
+# =========================================================
+# Variaveis de ambiente
+# =========================================================
+# .env.example DEVE ser versionado; .env (com valores reais/locais) nao.
+.env
+.env.*.local
+
+# =========================================================
+# Sistema operacional
+# =========================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================================================
+# Logs / arquivos temporarios de execucao
+# =========================================================
+*.log
+*.tmp
+*.pid
+
+# =========================================================
+# Dados de persistencia (gerados em runtime pelos servidores)
+# -----------------------------------------------------------
+# Os dados de logins, canais e publicações ficam em disco e não devem
+# entrar no Git.
+# =========================================================
+python/server/data/
+java/server/data/

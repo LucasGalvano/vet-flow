@@ -1,0 +1,231 @@
+# Protocolo Comum — Python ↔ Java
+
+Este documento é o contrato entre as duas implementações. Qualquer mudança
+aqui precisa ser refletida nas duas linguagens.
+
+## Serialização
+
+- Formato: **MessagePack** (binário), tanto para mensagens em rede (ZeroMQ)
+  quanto para persistência em disco.
+- JSON/XML/texto puro **não são usados** como formato transmitido, conforme
+  exigido pelo enunciado.
+
+## Envelope comum
+
+Toda mensagem trocada via ZeroMQ é um mapa MessagePack com esta forma:
+
+```
+{
+  "type": string,          // identifica o tipo da mensagem (ver tabela abaixo)
+  "sender_id": string,     // nome do bot (client) ou identificador do servidor
+  "sender_lang": string,   // "python" | "java" — apenas para depuração/testes
+                            // de interoperabilidade, não é usado em nenhuma
+                            // lógica de negócio
+  "timestamp": int64,      // epoch millis (UTC), obrigatório em toda mensagem
+  "logical_clock": int64,  // contador lógico do emissor (Parte 3)
+  "payload": map           // específico de cada "type"
+}
+```
+
+O emissor incrementa seu contador antes de cada envio. Ao receber uma
+mensagem, o processo atualiza o contador local para `max(local,
+logical_clock_recebido)`. Na próxima mensagem enviada, incrementa novamente.
+
+## Convenção de erro/sucesso
+
+Toda mensagem `*_RESPONSE` tem, no `payload`:
+
+- `status`: `"OK"` ou `"ERROR"`
+- `error_msg`: string, **obrigatória se `status == "ERROR"`**, ausente caso
+  contrário.
+
+## Parte 1 — Login, canais, listagem
+
+Socket ZeroMQ: **REQ (client) / REP (server)**, conforme especificado no
+enunciado.
+
+| type | Direção | payload |
+|---|---|---|
+| `LOGIN_REQUEST` | Client → Server | `{ "bot_name": string }` |
+| `LOGIN_RESPONSE` | Server → Client | `{ "status": "OK" }` ou `{ "status": "ERROR", "error_msg": string }` |
+| `CHANNEL_CREATE_REQUEST` | Client → Server | `{ "channel_name": string, "bot_name": string }` |
+| `CHANNEL_CREATE_RESPONSE` | Server → Client | `{ "status": ..., "error_msg"?: string }` |
+| `CHANNEL_LIST_REQUEST` | Client → Server | `{}` |
+| `CHANNEL_LIST_RESPONSE` | Server → Client | `{ "channels": [string] }` |
+| `ERROR_RESPONSE` | Server → Client | `{ "status": "ERROR", "error_msg": string }` |
+
+`ERROR_RESPONSE` é devolvido quando o servidor não consegue nem
+identificar o tipo da requisição — mensagem MessagePack malformada/truncada,
+envelope com `type` desconhecido ou ausente, ou campos com tipo
+estruturalmente incompatível (ex.: `payload` não é um mapa). Não deve ser
+confundido com os `*_RESPONSE` de erro específicos de cada operação (ex.:
+`LOGIN_RESPONSE` com `status: ERROR` para `bot_name` ausente), que seguem
+sendo usados quando o tipo da requisição foi identificado corretamente mas
+um campo esperado está ausente/inválido dentro do fluxo normal daquela
+operação.
+
+### Status desta etapa
+
+**Parte 1 completa e validada em Python e Java**: `LOGIN_REQUEST`/`LOGIN_RESPONSE`,
+`CHANNEL_CREATE_REQUEST`/`CHANNEL_CREATE_RESPONSE` e
+`CHANNEL_LIST_REQUEST`/`CHANNEL_LIST_RESPONSE`, com persistência em disco
+(MessagePack) para logins e canais.
+
+Interoperabilidade confirmada nos dois sentidos, para os três tipos de
+mensagem: Python client ↔ Python server, Java client ↔ Java server,
+Python client ↔ Java server, Java client ↔ Python server. Testado
+inclusive o caso mais importante: um canal criado por um bot Java,
+persistido por um servidor Python, e lido de volta corretamente por um
+client Python.
+
+Robustez validada: mensagens MessagePack malformadas, truncadas, com
+`payload`/envelope de tipo estruturalmente incorreto, ou `type`
+desconhecido, **não derrubam mais o servidor** — cada mensagem é tratada
+isoladamente e qualquer falha de decodificação/processamento vira um
+`ERROR_RESPONSE`, mantendo o servidor no ar (corrigido em Python e Java).
+
+Nome de canal duplicado é tratado como erro (`status: ERROR`), comparação
+exata case-sensitive — decisão de implementação, não especificada pelo
+enunciado.
+
+## Portas (Parte 1)
+
+| Serviço | Porta | Socket |
+|---|---|---|
+| Python Server | 5555 | REP |
+| Java Server | 5555 (container próprio) | REP |
+
+## Parte 2 — Pub/Sub
+
+### Portas
+
+| Serviço | Porta | Socket |
+|---|---|---|
+| Broker — lado publishers (servidores) | 5557 | `XSUB` (bind) |
+| Broker — lado subscribers (clients) | 5558 | `XPUB` (bind) |
+
+Fluxo: `Servers --PUB--> [XSUB broker XPUB] --SUB--> Clients`. O broker
+(`broker/broker.py`) não tem lógica de negócio — só `zmq.proxy()`.
+
+### Framing (multipart)
+
+Cada mensagem Pub/Sub é enviada como **2 frames**:
+
+1. **Frame 1 (tópico)**: `channel_name` em UTF-8 puro (ex.: `b"vacinas"`).
+   Este é o mecanismo de **roteamento** do ZeroMQ (o broker filtra por
+   prefixo de bytes neste frame) — **não é o conteúdo da mensagem**, e
+   não precisa (nem deve) ser MessagePack.
+2. **Frame 2 (envelope)**: o envelope completo, serializado em
+   MessagePack, igual ao padrão REQ/REP da Parte 1.
+
+⚠️ **Limitação conhecida, não corrigida**: o ZeroMQ faz *prefix match* no
+tópico, não igualdade exata. Um subscriber de `"vac"` também receberia
+mensagens de um canal `"vacinas"`. Aceitável neste projeto desde que os
+nomes de canal não compartilhem prefixos ambíguos.
+
+### Tipos de mensagem
+
+| type | Direção | payload |
+|---|---|---|
+| `PUBLISH_REQUEST` | Client → Server (REQ/REP) | `{ "channel_name": string, "message": string }` |
+| `PUBLISH_RESPONSE` | Server → Client (REQ/REP) | `{ "status": ..., "error_msg"?: string }` |
+| `CHANNEL_MESSAGE` | Server → Broker → Client (PUB/SUB) | `{ "channel_name": string, "message": string }` |
+
+`PUBLISH_REQUEST` exige que o canal já exista (criado via
+`CHANNEL_CREATE_REQUEST` na Parte 1); publicar em canal inexistente
+retorna `ERROR`.
+
+### Contrato de `PUBLISH_REQUEST` (campos e tipos)
+
+| Campo (`payload`) | Tipo | Obrigatório | Regra |
+|---|---|---|---|
+| `channel_name` | string | sim | não vazia; o canal precisa existir |
+| `message` | string | sim | não vazia |
+
+**Sem conversões implícitas.** O servidor não converte nenhum valor para
+texto: um campo só é aceito se já chegou como string MessagePack. Python e
+Java aplicam exatamente a mesma regra, na mesma ordem (`channel_name`
+primeiro, depois `message`; o primeiro erro encontrado é o devolvido):
+
+| Valor recebido no campo | Resultado |
+|---|---|
+| string não vazia | aceito |
+| campo ausente, `null` ou `""` | `ERROR`: `campo '<nome>' ausente ou vazio` |
+| número (inclusive `0`), booleano (inclusive `false`), lista, objeto/mapa (inclusive `[]` e `{}`) | `ERROR`: `campo '<nome>' deve ser uma string` |
+
+A checagem de tipo vem **antes** da de vazio: `0`, `false`, `[]` e `{}`
+são do tipo errado, não "vazios". Se o canal não existe, o erro é
+`canal '<nome>' nao existe`. As respostas de erro são `PUBLISH_RESPONSE`
+com `status: ERROR`; um `payload` que não é um mapa vira `ERROR_RESPONSE`
+(ver acima).
+
+**Requisição inválida não persiste nem publica:** toda validação acontece
+antes do primeiro `append` em `messages.msgpack` e antes do `PUB` no
+broker, então uma requisição rejeitada não deixa rastro em disco nem
+chega a subscribers.
+
+### Ordem persistência → publicação
+
+O servidor **persiste a mensagem em disco primeiro, só depois publica**
+no broker (nunca o inverso). Motivo: durabilidade antes de visibilidade —
+se a publicação falhar (ex.: broker fora do ar), a mensagem não se perde,
+só não chega a um subscriber ao vivo naquele instante (não há
+replay/catch-up nesta etapa).
+Por isso, uma falha ao publicar **depois** de persistir não é devolvida ao
+client como erro: o servidor registra o problema em log e responde
+`PUBLISH_RESPONSE` com `OK`, porque a mensagem está durável. Devolver erro
+aqui faria um retry do client gravar a mesma mensagem duas vezes
+(Python e Java têm o mesmo comportamento).
+
+Limitação conhecida: o `PUBLISH_RESPONSE OK` significa "persistido", não
+"entregue a subscribers".
+
+## Parte 3 — relógios e Reference Service
+
+O serviço de referência usa `REQ/REP` na porta `5559`, aceita mensagens
+MessagePack com o envelope comum e não recebe mensagens dos bots.
+
+| type | Direção | payload da requisição | campos adicionais na resposta |
+|---|---|---|---|
+| `REFERENCE_REGISTER_REQUEST` | Server → Reference | `{ "server_name": string }` | `rank`: rank estável atribuído ao nome |
+| `REFERENCE_LIST_REQUEST` | Server → Reference | `{}` | `servers`: lista de `{ "name": string, "rank": int }` disponíveis |
+| `REFERENCE_HEARTBEAT_REQUEST` | Server → Reference | `{ "server_name": string }` | `rank`: rank do servidor; `reference_time_ms`: hora física de referência |
+
+O serviço responde com `REFERENCE_RESPONSE` e `payload.status`. Os ranks são
+atribuídos uma vez por nome e mantidos durante a vida do serviço. Heartbeats
+renovam a disponibilidade; nomes sem heartbeat por 30 segundos saem da lista
+disponível e mantêm seu rank para um registro posterior. O intervalo pode ser
+alterado por `REFERENCE_TIMEOUT_SECONDS`.
+
+Cada servidor solicita rank ao iniciar. Depois, envia heartbeat a cada 10
+mensagens de clientes recebidas. O timestamp físico dos envelopes seguintes
+usa o deslocamento calculado entre o relógio local do servidor e
+`reference_time_ms` recebido no heartbeat. O processo não altera o relógio do
+sistema operacional do container.
+
+O broker e o proxy não interpretam nem modificam `logical_clock`; eles
+repassam a publicação multipart sem alterações.
+
+### Status desta etapa
+
+**Implementado e testado em Python** (servidor + client reais, ponta a
+ponta): `PUBLISH_REQUEST`/`PUBLISH_RESPONSE` via REQ/REP, persistência em
+`messages.msgpack`, publicação no broker, e `ACTION=SUBSCRIBE` do client
+recebendo a mensagem em tempo real via `SUB` direto no broker. Validado
+também o caso de erro (publicar em canal inexistente).
+
+**Implementado e testado em Java** (Java client + Java server + broker,
+ponta a ponta): `PUB` socket conectado ao broker, handler
+`PUBLISH_REQUEST` espelhando o Python, `ACTION=PUBLISH` e
+`ACTION=SUBSCRIBE` no client. Subscriber Java recebeu a mensagem em tempo
+real e a persistência em `messages.msgpack` foi confirmada no restart.
+
+**Interoperabilidade cruzada Pub/Sub confirmada** nos dois sentidos:
+servidor Python → subscriber Java e servidor Java → subscriber Python
+(multipart do JeroMQ + envelope do Jackson decodificados corretamente
+pelo `SUB` em Python, e vice-versa).
+
+**Docker validado:** `broker/Dockerfile` e os serviços/bots de Pub/Sub no
+`docker-compose.yml` rodaram com `docker compose up --build`. Dois
+subscribers (Python e Java) receberam, cada um, as duas mensagens
+publicadas por servidores de linguagens diferentes no mesmo tópico.
