@@ -218,6 +218,7 @@ Envelope (mapa MessagePack), igual em REQ/REP e em Pub/Sub:
 | D21 | Timeout padrão de disponibilidade de 30s, configurável | O enunciado não fixa quanto tempo esperar para detectar ausência |
 | D22 | Heartbeat executado no loop sequencial do REP | Cada décima mensagem pode pausar o servidor durante a chamada ao serviço de referência |
 | D23 | `ACTION=BOT_LOOP` implementa o fluxo contínuo exigido | Completa até cinco canais, assina até três e publica 10 mensagens por ciclo, com 1s entre mensagens |
+| D24 | Servidor **resiliente ao Reference**: socket `REQ` recriado após falha; **inicia sem Reference** e tenta registrar com backoff; `REFERENCE_TIMEOUT_MS` (padrão 1000) | Reproduzidos na bateria: heartbeat nunca se recuperava (REQ preso), servidor caía na partida, requisição travava 5 s. Sem threads (D22 mantida): o `recv` do `REP` acorda a cada 500 ms para tentar o registro. **No Java o socket do Reference é criado sob demanda**: o JeroMQ lança `ZMQException` no `connect` quando o hostname não resolve (o libzmq do Python aceita), o que derrubava o servidor na partida e na recriação do socket. Alternativas descartadas: thread de heartbeat (reabre concorrência, §8); `restart: on-failure` (o Java saía com código 0) |
 
 ---
 
@@ -245,12 +246,14 @@ Envelope (mapa MessagePack), igual em REQ/REP e em Pub/Sub:
 - Na máquina de vocês: as 17 verificações de resposta passaram **[EXEC-LOCAL]**, mas o check de publicação falhou com `recebido: []` (Pub/Sub inoperante — provavelmente broker fora do ar) e a persistência **não foi verificada** (faltou `--messages-file`).
 - **Ainda não confirmado:** rodar o teste completo (broker no ar + `--messages-file`) **no Python e no Java com `mvn package`**, e reexecutar `docker compose up --build` depois da mudança.
 
-### Parte 3 — relógios, heartbeat e Reference Service: **implementada nesta branch; validação ponta a ponta pendente**
+### Parte 3 — relógios, heartbeat e Reference Service: **implementada; 3 bugs de resiliência corrigidos (D24)**
 
-- Reference Service, ranks estáveis, listagem e expiração: **[LIDO]**; 3 testes unitários do registro passaram **[EXEC-SANDBOX]**.
-- Relógio lógico em clients/servers Python/Java, offset físico e heartbeat por 10 mensagens: **[LIDO]**.
-- Compose atualizado e YAML validado com PyYAML: **[EXEC-SANDBOX]**.
-- Docker Compose e build Java/Maven ainda não executados: Docker, Maven, `javac` e `pyzmq` não estão disponíveis neste ambiente.
+- Bateria `tests/test_part3_battery.py` **antes** do patch, na máquina de um integrante: **[EXEC-LOCAL]** Python 14 PASS / 3 FAIL; Java 18 PASS / 3 FAIL (incluindo o `BOT_LOOP` do client Java). Os 3 FAIL eram os bugs #1 (heartbeat não se recupera), #2 (servidor encerra na partida sem Reference) e #3 (requisição do heartbeat bloqueia ~5 s).
+- **Depois** do patch (D24), bateria completa: Python **18 PASS / 0 FAIL** e Java **18 PASS / 0 FAIL** **[EXEC-SANDBOX]** (o Java foi compilado com dependências montadas à mão, **não** com `mvn package`; o `BOT_LOOP` do client Java **não** foi exercitado pela bateria nesse run). **Revalidação na máquina de vocês: pendente.**
+- Cenário "sem Reference → Reference sobe depois → registra no mesmo processo, sem reinicialização": **[EXEC-SANDBOX]** Python e Java; backoff 1s→2s→4s→8s visível no log. `REFERENCE_TIMEOUT_MS` efetivo: 10ª requisição levou ~1,00 s (padrão) e ~0,30 s com `300`, nas duas linguagens.
+- Hostname do Reference que **não resolve** (simulação do DNS do Docker via `/etc/hosts`: inexistente → passa a resolver → some → volta): Python e Java sobrevivem, entram no backoff e se registram no mesmo processo **[EXEC-SANDBOX]**. Antes da correção complementar o **Java encerrava na partida** nesse cenário. **Docker Compose real: ainda não executado.**
+- **Limitações abertas:** a troca com o Reference ainda bloqueia o servidor por até `REFERENCE_TIMEOUT_MS`; um servidor **ocioso** não percebe que o Reference perdeu o registro (só volta à lista no próximo heartbeat, a cada 10 mensagens); heartbeat por contagem de mensagens depende do enunciado, **não verificado**.
+- Docker Compose da Parte 3: **não executado por ninguém**. Conformidade com o texto do enunciado: **não verificada**.
 
 ### Partes 4 e 5: **não iniciadas**
 

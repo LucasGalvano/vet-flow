@@ -197,7 +197,10 @@ renovam a disponibilidade; nomes sem heartbeat por 30 segundos saem da lista
 disponível e mantêm seu rank para um registro posterior. O intervalo pode ser
 alterado por `REFERENCE_TIMEOUT_SECONDS`.
 
-Cada servidor solicita rank ao iniciar. Depois, envia heartbeat a cada 10
+Cada servidor solicita rank ao iniciar; se o Reference estiver indisponível,
+o servidor inicia assim mesmo e repete o registro com backoff até conseguir.
+Uma falha de comunicação com o Reference nunca encerra o servidor. Depois de
+registrado, envia heartbeat a cada 10
 mensagens de clientes recebidas. O timestamp físico dos envelopes seguintes
 usa o deslocamento calculado entre o relógio local do servidor e
 `reference_time_ms` recebido no heartbeat. O processo não altera o relógio do

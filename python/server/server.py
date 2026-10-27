@@ -40,6 +40,19 @@ BROKER_XSUB_ADDRESS = os.environ.get("BROKER_XSUB_ADDRESS", "tcp://localhost:555
 REFERENCE_ADDRESS = os.environ.get("REFERENCE_ADDRESS", "tcp://localhost:5559")
 SERVER_NAME = os.environ.get("SERVER_NAME", "python-server")
 HEARTBEAT_EVERY = int(os.environ.get("HEARTBEAT_EVERY", "10"))
+# Resiliencia frente a um Reference Service indisponivel (ver CONTEXTO.md, D24):
+#  - timeout de cada troca com o Reference (antes fixo em 5000 ms);
+#  - tentativas explicitas de registro, com intervalo inicial e backoff
+#    exponencial limitado (o intervalo dobra a cada falha ate o maximo).
+REFERENCE_TIMEOUT_MS = max(1, int(os.environ.get("REFERENCE_TIMEOUT_MS", "1000")))
+REFERENCE_RETRY_INITIAL_SECONDS = max(
+    0.05, float(os.environ.get("REFERENCE_RETRY_INITIAL_SECONDS", "1")))
+REFERENCE_RETRY_MAX_SECONDS = max(
+    REFERENCE_RETRY_INITIAL_SECONDS,
+    float(os.environ.get("REFERENCE_RETRY_MAX_SECONDS", "10")))
+# O recv do REP "acorda" a cada IDLE_TICK_MS para o loop poder tentar o
+# registro mesmo sem trafego de clients (sem threads).
+IDLE_TICK_MS = 500
 
 # Estado em memoria, carregado do disco ao iniciar. Seguro sem lock
 # porque o loop principal (main) processa uma requisicao REP por vez,
@@ -54,6 +67,10 @@ logical_clock = 0
 clock_offset_ms = 0
 client_messages_received = 0
 server_rank = None
+zmq_context = None
+reference_registered = False
+registration_retry_delay = REFERENCE_RETRY_INITIAL_SECONDS
+next_registration_attempt = 0.0
 
 
 def physical_timestamp_ms() -> int:
@@ -81,11 +98,41 @@ def build_envelope(msg_type: str, payload: dict) -> dict:
     }
 
 
+def new_reference_socket():
+    sock = zmq_context.socket(zmq.REQ)
+    sock.setsockopt(zmq.RCVTIMEO, REFERENCE_TIMEOUT_MS)
+    sock.setsockopt(zmq.SNDTIMEO, REFERENCE_TIMEOUT_MS)
+    sock.setsockopt(zmq.LINGER, 0)
+    sock.connect(REFERENCE_ADDRESS)
+    return sock
+
+
+def reset_reference_socket() -> None:
+    """Descarta e recria o socket REQ do Reference.
+
+    Um REQ que estourou o timeout fica preso em "aguardando resposta": todo
+    send seguinte falha com "Operation cannot be accomplished in current
+    state" e ele nunca se recupera sozinho. Recriar o socket (LINGER 0 descarta
+    a requisicao pendente) e a forma padrao de sair desse estado.
+    """
+    global reference_socket
+    try:
+        reference_socket.close()
+    except Exception:
+        pass
+    reference_socket = new_reference_socket()
+
+
 def reference_request(msg_type: str, payload: dict) -> dict:
     """Troca uma mensagem MessagePack com o Reference Service."""
     request = build_envelope(msg_type, payload)
-    reference_socket.send(msgpack.packb(request, use_bin_type=True))
-    response = msgpack.unpackb(reference_socket.recv(), raw=False)
+    try:
+        reference_socket.send(msgpack.packb(request, use_bin_type=True))
+        raw_response = reference_socket.recv()
+    except zmq.ZMQError:
+        reset_reference_socket()
+        raise
+    response = msgpack.unpackb(raw_response, raw=False)
     observe_message(response)
     response_payload = response.get("payload") or {}
     reference_time = response_payload.get("reference_time_ms")
@@ -97,7 +144,46 @@ def reference_request(msg_type: str, payload: dict) -> dict:
     return response_payload
 
 
+def schedule_registration_retry(reason) -> None:
+    """Marca o servidor como nao registrado e agenda a proxima tentativa."""
+    global reference_registered, registration_retry_delay, next_registration_attempt
+    reference_registered = False
+    next_registration_attempt = time.monotonic() + registration_retry_delay
+    print(f"[REFERENCE] indisponivel ({reason}); nova tentativa de registro "
+          f"em {registration_retry_delay:g}s")
+    registration_retry_delay = min(registration_retry_delay * 2,
+                                   REFERENCE_RETRY_MAX_SECONDS)
+
+
+def try_register() -> bool:
+    """Tenta registrar no Reference. Nunca levanta excecao: em falha, agenda a
+    proxima tentativa (backoff)."""
+    global server_rank, reference_registered, registration_retry_delay
+    try:
+        registration = reference_request(
+            "REFERENCE_REGISTER_REQUEST", {"server_name": SERVER_NAME}
+        )
+    except Exception as exc:
+        schedule_registration_retry(exc)
+        return False
+    server_rank = registration.get("rank")
+    reference_registered = True
+    registration_retry_delay = REFERENCE_RETRY_INITIAL_SECONDS
+    print(f"[SERVER] registrado como {SERVER_NAME}, rank={server_rank}, "
+          f"hora ajustada em {clock_offset_ms}ms")
+    return True
+
+
+def maybe_register() -> None:
+    """Chamado pelo loop principal: se nao ha registro e ja passou a hora da
+    proxima tentativa, tenta registrar."""
+    if not reference_registered and time.monotonic() >= next_registration_attempt:
+        try_register()
+
+
 def send_heartbeat() -> None:
+    if not reference_registered:
+        return  # sem registro, quem cuida disso e maybe_register()
     try:
         payload = reference_request(
             "REFERENCE_HEARTBEAT_REQUEST", {"server_name": SERVER_NAME}
@@ -106,6 +192,7 @@ def send_heartbeat() -> None:
               f"offset={clock_offset_ms}ms")
     except Exception as exc:
         print(f"[HEARTBEAT] falha ao sincronizar com referência: {exc}")
+        schedule_registration_retry(exc)
 
 
 def handle_login_request(envelope: dict) -> dict:
@@ -290,7 +377,7 @@ def dispatch(envelope: dict) -> dict:
 
 def main():
     global known_logins, known_channels, pub_socket, reference_socket
-    global client_messages_received, server_rank
+    global client_messages_received, zmq_context
     known_logins = persistence.load_logins(LOGINS_PATH)
     known_channels = persistence.load_channels(CHANNELS_PATH)
     known_messages = persistence.load_messages(MESSAGES_PATH)
@@ -301,7 +388,9 @@ def main():
     )
 
     context = zmq.Context()
+    zmq_context = context
     socket = context.socket(zmq.REP)
+    socket.setsockopt(zmq.RCVTIMEO, IDLE_TICK_MS)
     socket.bind(BIND_ADDRESS)
     print(f"[SERVER] Python Server (REP) ouvindo em {BIND_ADDRESS}")
 
@@ -311,20 +400,20 @@ def main():
     pub_socket.connect(BROKER_XSUB_ADDRESS)
     print(f"[SERVER] PUB conectado ao broker em {BROKER_XSUB_ADDRESS}")
 
-    reference_socket = context.socket(zmq.REQ)
-    reference_socket.setsockopt(zmq.RCVTIMEO, 5000)
-    reference_socket.setsockopt(zmq.LINGER, 0)
-    reference_socket.connect(REFERENCE_ADDRESS)
-    registration = reference_request(
-        "REFERENCE_REGISTER_REQUEST", {"server_name": SERVER_NAME}
-    )
-    server_rank = registration.get("rank")
-    print(f"[SERVER] registrado como {SERVER_NAME}, rank={server_rank}, "
-          f"hora ajustada em {clock_offset_ms}ms")
+    reference_socket = new_reference_socket()
+    # O registro inicial NAO e mais fatal: se o Reference estiver fora do ar, o
+    # servidor sobe mesmo assim e tenta de novo (backoff) a partir do loop.
+    if not try_register():
+        print("[SERVER] iniciado SEM registro no Reference Service; "
+              "novas tentativas automaticas em andamento")
 
     try:
         while True:
-            raw = socket.recv()
+            try:
+                raw = socket.recv()
+            except zmq.Again:
+                maybe_register()  # ocioso: aproveita para tentar o registro
+                continue
             client_messages_received += 1
             if client_messages_received % HEARTBEAT_EVERY == 0:
                 send_heartbeat()
@@ -353,6 +442,7 @@ def main():
 
             socket.send(msgpack.packb(response, use_bin_type=True))
             print(f"[SEND] {response}")
+            maybe_register()  # depois de responder: a tentativa nao atrasa o client
     except KeyboardInterrupt:
         print("\n[SERVER] Encerrando...")
     finally:

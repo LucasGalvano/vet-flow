@@ -156,6 +156,9 @@ obrigatória — todas têm valor padrão seguro no código.
 | `REFERENCE_ADDRESS` | server | `tcp://localhost:5559` | Endereço do serviço de referência |
 | `SERVER_NAME` | server | nome da implementação | Nome único usado no registro e heartbeat |
 | `HEARTBEAT_EVERY` | server | `10` | Mensagens de clientes entre heartbeats |
+| `REFERENCE_TIMEOUT_MS` | server | `1000` | Quanto o servidor espera a resposta do Reference Service em cada troca (registro/heartbeat). **Não confundir** com `REFERENCE_TIMEOUT_SECONDS`, que é do lado do Reference |
+| `REFERENCE_RETRY_INITIAL_SECONDS` | server | `1` | Intervalo inicial entre tentativas de registro quando o Reference está indisponível |
+| `REFERENCE_RETRY_MAX_SECONDS` | server | `10` | Teto do backoff (o intervalo dobra a cada falha até este valor) |
 | `REFERENCE_TIMEOUT_SECONDS` | reference | `30` | Tempo sem heartbeat para remover servidor da lista disponível |
 
 O projeto **não** usa `python-dotenv` — as variáveis são lidas diretamente
@@ -256,6 +259,9 @@ java -jar target\vetflow-client.jar
 
 O serviço de referência fica em `reference/` e usa `REQ/REP` MessagePack na
 porta `5559`. Cada servidor se registra ao iniciar e recebe um rank estável.
+Se o Reference estiver indisponível na partida, o servidor **sobe mesmo assim** e
+tenta registrar-se de novo automaticamente, com backoff, sem precisar ser
+reiniciado.
 O tipo `REFERENCE_LIST_REQUEST` retorna os servidores disponíveis com seus
 ranks. O servidor envia `REFERENCE_HEARTBEAT_REQUEST` a cada 10 mensagens de
 clientes; a resposta contém a hora de referência e ajusta o deslocamento
@@ -265,6 +271,27 @@ O serviço mantém ranks mesmo depois de um processo ficar indisponível. A
 lista de disponíveis é uma lease em memória: após **30 segundos** sem
 heartbeat o servidor sai da lista, mas conserva o mesmo rank ao se registrar
 novamente. Esse limite pode ser alterado com `REFERENCE_TIMEOUT_SECONDS`.
+
+**Resiliência frente a um Reference indisponível.** O servidor não fica preso a
+ele: a troca com o Reference tem timeout curto (`REFERENCE_TIMEOUT_MS`, padrão
+1000 ms); depois de uma falha de comunicação o socket `REQ` é **recriado** (um
+`REQ` que estoura o timeout fica inutilizável); uma falha de heartbeat volta o
+servidor ao estado "não registrado" e as tentativas de registro seguem com
+backoff (`REFERENCE_RETRY_INITIAL_SECONDS` → `REFERENCE_RETRY_MAX_SECONDS`).
+Isso roda no mesmo loop único do `REP` (sem threads): o `recv` acorda a cada
+500 ms para tentar o registro mesmo sem tráfego.
+
+Limitações conhecidas: (1) uma troca com o Reference ainda **bloqueia o servidor**
+por até `REFERENCE_TIMEOUT_MS` (a tentativa de registro roda *depois* de responder
+ao client, mas a seguinte espera por ela); (2) um servidor **ocioso** não percebe
+que o Reference reiniciou e perdeu o registro: ele só volta à lista no próximo
+heartbeat (10 mensagens), porque não há heartbeat por tempo.
+(3) no Docker o Reference é um **nome de host** (`reference-service`). O socket
+para ele é criado sob demanda, então um nome que ainda não resolve (container do
+Reference ausente ou parado) conta como "Reference indisponível" e entra no mesmo
+backoff, em vez de derrubar o servidor. No **Java**, a JVM guarda em cache a falha
+de DNS por ~10 s (`networkaddress.cache.negative.ttl`), então o registro pode
+demorar esse tempo a mais depois que o Reference passa a existir.
 
 Todos os envelopes de aplicação agora contêm `logical_clock`. Cada emissor
 incrementa antes de enviar; ao receber, atualiza seu contador para o máximo

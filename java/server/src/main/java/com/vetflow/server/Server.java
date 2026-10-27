@@ -53,6 +53,20 @@ public class Server {
     private static final int HEARTBEAT_EVERY =
             Integer.parseInt(System.getenv().getOrDefault("HEARTBEAT_EVERY", "10"));
 
+    // Resiliencia frente a um Reference Service indisponivel (ver CONTEXTO.md, D24):
+    //  - timeout de cada troca com o Reference (antes fixo em 5000 ms);
+    //  - tentativas explicitas de registro, com intervalo inicial e backoff
+    //    exponencial limitado (o intervalo dobra a cada falha ate o maximo).
+    private static final int REFERENCE_TIMEOUT_MS = Math.max(1,
+            Integer.parseInt(System.getenv().getOrDefault("REFERENCE_TIMEOUT_MS", "1000")));
+    private static final double REFERENCE_RETRY_INITIAL_SECONDS = Math.max(0.05,
+            Double.parseDouble(System.getenv().getOrDefault("REFERENCE_RETRY_INITIAL_SECONDS", "1")));
+    private static final double REFERENCE_RETRY_MAX_SECONDS = Math.max(REFERENCE_RETRY_INITIAL_SECONDS,
+            Double.parseDouble(System.getenv().getOrDefault("REFERENCE_RETRY_MAX_SECONDS", "10")));
+    // O recv do REP "acorda" a cada IDLE_TICK_MS para o loop poder tentar o
+    // registro mesmo sem trafego de clients (sem threads).
+    private static final int IDLE_TICK_MS = 500;
+
     // Estado em memoria, seguro sem lock porque o loop principal processa
     // uma requisicao REP por vez, sequencialmente (mesma premissa do
     // server Python -- ver nota em Persistence.java).
@@ -66,6 +80,10 @@ public class Server {
     private static long clockOffsetMs = 0;
     private static long clientMessagesReceived = 0;
     private static Object serverRank;
+    private static ZContext zmqContext;
+    private static boolean referenceRegistered = false;
+    private static double registrationRetryDelay = REFERENCE_RETRY_INITIAL_SECONDS;
+    private static long nextRegistrationAttemptMs = 0;
 
     public static void main(String[] args) {
         knownLogins = Persistence.loadList(LOGINS_PATH);
@@ -76,7 +94,9 @@ public class Server {
                 knownLogins.size(), knownChannels.size(), knownMessages.size());
 
         try (ZContext ctx = new ZContext()) {
+            zmqContext = ctx;
             ZMQ.Socket socket = ctx.createSocket(SocketType.REP);
+            socket.setReceiveTimeOut(IDLE_TICK_MS);
             socket.bind(BIND_ADDRESS);
             System.out.println("[SERVER] Java Server (REP) ouvindo em " + BIND_ADDRESS);
 
@@ -86,19 +106,22 @@ public class Server {
             pubSocket.connect(BROKER_XSUB_ADDRESS);
             System.out.println("[SERVER] PUB conectado ao broker em " + BROKER_XSUB_ADDRESS);
 
-            referenceSocket = ctx.createSocket(SocketType.REQ);
-            referenceSocket.setReceiveTimeOut(5000);
-            referenceSocket.setLinger(0);
-            referenceSocket.connect(REFERENCE_ADDRESS);
-            Map<String, Object> registration = referenceRequest(
-                    "REFERENCE_REGISTER_REQUEST", Map.of("server_name", SERVER_NAME));
-            serverRank = registration.get("rank");
-            System.out.printf("[SERVER] registrado como %s, rank=%s, hora ajustada em %dms%n",
-                    SERVER_NAME, serverRank, clockOffsetMs);
+            // O socket do Reference e criado SOB DEMANDA (ver referenceRequest):
+            // criar/conectar pode falhar (ex.: hostname do Reference sem
+            // resolucao no Docker) e isso deve contar como "Reference
+            // indisponivel", nao como erro fatal.
+            // O registro inicial NAO e mais fatal: se o Reference estiver fora
+            // do ar, o servidor sobe mesmo assim e tenta de novo (backoff) a
+            // partir do loop principal.
+            if (!tryRegister()) {
+                System.out.println("[SERVER] iniciado SEM registro no Reference Service; "
+                        + "novas tentativas automaticas em andamento");
+            }
 
             while (!Thread.currentThread().isInterrupted()) {
                 byte[] raw = socket.recv(0);
                 if (raw == null) {
+                    maybeRegister(); // ocioso: aproveita para tentar o registro
                     continue;
                 }
                 clientMessagesReceived++;
@@ -130,6 +153,7 @@ public class Server {
                 byte[] out = MAPPER.writeValueAsBytes(response);
                 socket.send(out, 0);
                 System.out.println("[SEND] " + response);
+                maybeRegister(); // depois de responder: a tentativa nao atrasa o client
             }
         } catch (Exception e) {
             System.err.println("[SERVER] Erro fatal: " + e.getMessage());
@@ -157,11 +181,94 @@ public class Server {
     }
 
     @SuppressWarnings("unchecked")
+    private static ZMQ.Socket newReferenceSocket() {
+        ZMQ.Socket sock = zmqContext.createSocket(SocketType.REQ);
+        sock.setReceiveTimeOut(REFERENCE_TIMEOUT_MS);
+        sock.setSendTimeOut(REFERENCE_TIMEOUT_MS);
+        sock.setLinger(0);
+        sock.connect(REFERENCE_ADDRESS);
+        return sock;
+    }
+
+    /**
+     * Descarta e recria o socket REQ do Reference.
+     *
+     * Um REQ que estourou o timeout fica preso em "aguardando resposta": todo
+     * send seguinte falha e ele nunca se recupera sozinho. Recriar o socket
+     * (linger 0 descarta a requisicao pendente) e a forma padrao de sair
+     * desse estado.
+     */
+    private static void resetReferenceSocket() {
+        try {
+            if (referenceSocket != null) {
+                referenceSocket.close(); // (ZContext tambem remove o socket da sua lista)
+            }
+        } catch (Exception ignored) {
+            // melhor esforco
+        }
+        // Recriado sob demanda por referenceRequest(): se criar falhar agora
+        // (ex.: DNS do Reference fora do ar), a excecao nao pode escapar daqui.
+        referenceSocket = null;
+    }
+
+    private static long nowMs() {
+        return System.nanoTime() / 1_000_000L;
+    }
+
+    /** Marca o servidor como nao registrado e agenda a proxima tentativa. */
+    private static void scheduleRegistrationRetry(String reason) {
+        referenceRegistered = false;
+        nextRegistrationAttemptMs = nowMs() + (long) (registrationRetryDelay * 1000);
+        System.out.printf("[REFERENCE] indisponivel (%s); nova tentativa de registro em %ss%n",
+                reason, formatSeconds(registrationRetryDelay));
+        registrationRetryDelay = Math.min(registrationRetryDelay * 2, REFERENCE_RETRY_MAX_SECONDS);
+    }
+
+    private static String formatSeconds(double seconds) {
+        return seconds == Math.rint(seconds) ? String.valueOf((long) seconds) : String.valueOf(seconds);
+    }
+
+    /** Tenta registrar no Reference. Nunca lanca: em falha, agenda a proxima tentativa (backoff). */
+    private static boolean tryRegister() {
+        try {
+            Map<String, Object> registration = referenceRequest(
+                    "REFERENCE_REGISTER_REQUEST", Map.of("server_name", SERVER_NAME));
+            serverRank = registration.get("rank");
+        } catch (Exception e) {
+            scheduleRegistrationRetry(String.valueOf(e.getMessage()));
+            return false;
+        }
+        referenceRegistered = true;
+        registrationRetryDelay = REFERENCE_RETRY_INITIAL_SECONDS;
+        System.out.printf("[SERVER] registrado como %s, rank=%s, hora ajustada em %dms%n",
+                SERVER_NAME, serverRank, clockOffsetMs);
+        return true;
+    }
+
+    /** Chamado pelo loop principal: se nao ha registro e ja passou a hora da proxima tentativa, tenta. */
+    private static void maybeRegister() {
+        if (!referenceRegistered && nowMs() >= nextRegistrationAttemptMs) {
+            tryRegister();
+        }
+    }
+
     private static Map<String, Object> referenceRequest(String type, Map<String, Object> payload) throws Exception {
         Map<String, Object> request = buildEnvelope(type, payload);
-        referenceSocket.send(MAPPER.writeValueAsBytes(request), 0);
-        byte[] raw = referenceSocket.recv(0);
+        byte[] raw;
+        try {
+            if (referenceSocket == null) {
+                referenceSocket = newReferenceSocket(); // pode lancar (DNS etc.)
+            }
+            if (!referenceSocket.send(MAPPER.writeValueAsBytes(request), 0)) {
+                throw new IllegalStateException("Reference Service: falha ao enviar");
+            }
+            raw = referenceSocket.recv(0);
+        } catch (RuntimeException e) {
+            resetReferenceSocket();
+            throw e;
+        }
         if (raw == null) {
+            resetReferenceSocket();
             throw new IllegalStateException("Reference Service sem resposta");
         }
         Map<String, Object> response = MAPPER.readValue(raw, Map.class);
@@ -178,6 +285,9 @@ public class Server {
     }
 
     private static void sendHeartbeat() {
+        if (!referenceRegistered) {
+            return; // sem registro, quem cuida disso e maybeRegister()
+        }
         try {
             Map<String, Object> response = referenceRequest(
                     "REFERENCE_HEARTBEAT_REQUEST", Map.of("server_name", SERVER_NAME));
@@ -185,6 +295,7 @@ public class Server {
                     SERVER_NAME, response.get("rank"), clockOffsetMs);
         } catch (Exception e) {
             System.err.println("[HEARTBEAT] falha ao sincronizar com referência: " + e.getMessage());
+            scheduleRegistrationRetry(String.valueOf(e.getMessage()));
         }
     }
 
