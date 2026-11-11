@@ -28,7 +28,8 @@ clock_lock = threading.Lock()
 def observe_message(envelope: dict) -> None:
     global logical_clock
     received = envelope.get("logical_clock", 0)
-    if isinstance(received, int):
+    # Mesma faixa aceita pelos servidores (ver server.py): ignora valor invalido.
+    if isinstance(received, int) and not isinstance(received, bool) and 0 <= received <= 2**63 - 2:
         with clock_lock:
             logical_clock = max(logical_clock, received)
 
@@ -123,7 +124,8 @@ def run_subscribe(context, channels, duration=None):
             print(f"[PUBSUB-RECV] canal={topic.decode('utf-8')} "
                   f"mensagem={envelope.get('payload', {}).get('message')} "
                   f"timestamp_envio={envelope.get('timestamp')} "
-                  f"timestamp_recebimento={received_at}")
+                  f"timestamp_recebimento={received_at} "
+                  f"logical_clock={envelope.get('logical_clock')}")
             received += 1
         except zmq.error.Again:
             pass

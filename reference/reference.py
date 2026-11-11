@@ -10,6 +10,8 @@ from registry import ServerRegistry
 
 BIND_ADDRESS = os.environ.get("REFERENCE_BIND_ADDRESS", "tcp://*:5559")
 TIMEOUT_SECONDS = float(os.environ.get("REFERENCE_TIMEOUT_SECONDS", "30"))
+# Maior contador remoto aceito: Long.MAX_VALUE - 1 (folga para o +1 do envio).
+MAX_LOGICAL_CLOCK = 2**63 - 2
 
 
 def main():
@@ -28,7 +30,10 @@ def main():
                 if not isinstance(request, dict):
                     raise ValueError("envelope deve ser um mapa")
                 received_clock = request.get("logical_clock", 0)
-                if isinstance(received_clock, int):
+                # Ignora contador invalido/fora de faixa (ver MAX_LOGICAL_CLOCK):
+                # 2**64-1 estourava o uint64 do MessagePack e derrubava o servico.
+                if (isinstance(received_clock, int) and not isinstance(received_clock, bool)
+                        and 0 <= received_clock <= MAX_LOGICAL_CLOCK):
                     logical_clock = max(logical_clock, received_clock)
 
                 payload = request.get("payload") or {}
@@ -62,6 +67,7 @@ def main():
                     "logical_clock": logical_clock,
                     "payload": response_payload,
                 }
+                out = msgpack.packb(response, use_bin_type=True)
                 print(f"[RECV] {request}\n[SEND] {response}")
             except Exception as exc:
                 logical_clock += 1
@@ -73,7 +79,8 @@ def main():
                     "logical_clock": logical_clock,
                     "payload": {"status": "ERROR", "error_msg": str(exc)},
                 }
-            socket.send(msgpack.packb(response, use_bin_type=True))
+                out = msgpack.packb(response, use_bin_type=True)
+            socket.send(out)
     except KeyboardInterrupt:
         print("\n[REFERENCE] encerrando")
     finally:

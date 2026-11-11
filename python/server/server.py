@@ -77,10 +77,18 @@ def physical_timestamp_ms() -> int:
     return int(time.time() * 1000) + clock_offset_ms
 
 
+# Maior contador remoto aceito: Long.MAX_VALUE - 1, deixando folga para o +1 do
+# proximo envio. Valores fora de [0, MAX_LOGICAL_CLOCK] (negativos, booleanos,
+# ou >= 2**63) sao IGNORADOS em vez de adotados: um contador de 2**64-1 fazia o
+# proximo `+= 1` estourar o uint64 do MessagePack e derrubar o processo.
+MAX_LOGICAL_CLOCK = 2**63 - 2
+
+
 def observe_message(envelope: dict) -> None:
     global logical_clock
     value = envelope.get("logical_clock", 0)
-    if isinstance(value, int):
+    if (isinstance(value, int) and not isinstance(value, bool)
+            and 0 <= value <= MAX_LOGICAL_CLOCK):
         logical_clock = max(logical_clock, value)
 
 
@@ -90,7 +98,7 @@ def build_envelope(msg_type: str, payload: dict) -> dict:
     logical_clock += 1
     return {
         "type": msg_type,
-        "sender_id": "python-server",
+        "sender_id": SERVER_NAME,
         "sender_lang": "python",
         "timestamp": physical_timestamp_ms(),  # epoch millis, UTC sincronizado
         "logical_clock": logical_clock,
@@ -430,6 +438,7 @@ def main():
                 observe_message(envelope)
                 print(f"[RECV] {envelope}")
                 response = dispatch(envelope)
+                out = msgpack.packb(response, use_bin_type=True)
             except Exception as e:
                 print(f"[ERROR] Falha ao processar mensagem: {e}")
                 response = build_envelope(
@@ -439,8 +448,9 @@ def main():
                         "error_msg": f"mensagem invalida ou mal-formada: {e}",
                     },
                 )
+                out = msgpack.packb(response, use_bin_type=True)
 
-            socket.send(msgpack.packb(response, use_bin_type=True))
+            socket.send(out)
             print(f"[SEND] {response}")
             maybe_register()  # depois de responder: a tentativa nao atrasa o client
     except KeyboardInterrupt:
