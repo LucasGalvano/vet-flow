@@ -76,6 +76,12 @@ public class Server {
     // Socket PUB, criado em main() e usado pelo handler de PUBLISH_REQUEST.
     private static ZMQ.Socket pubSocket;
     private static ZMQ.Socket referenceSocket;
+    // Maior contador remoto aceito: Long.MAX_VALUE - 1, deixando folga para o +1
+    // do proximo envio. Valores fora de [0, MAX_LOGICAL_CLOCK] (negativos, ou
+    // >= 2^63) e tipos nao inteiros (double, boolean) sao IGNORADOS em vez de
+    // adotados: antes, 2^63-1 fazia o contador estourar para Long.MIN_VALUE e
+    // o relogio logico andava para tras. Mesma regra do server.py.
+    private static final long MAX_LOGICAL_CLOCK = Long.MAX_VALUE - 1;
     private static long logicalClock = 0;
     private static long clockOffsetMs = 0;
     private static long clientMessagesReceived = 0;
@@ -165,7 +171,7 @@ public class Server {
         logicalClock++;
         Map<String, Object> envelope = new LinkedHashMap<>();
         envelope.put("type", type);
-        envelope.put("sender_id", "java-server");
+        envelope.put("sender_id", SERVER_NAME);
         envelope.put("sender_lang", "java");
         envelope.put("timestamp", System.currentTimeMillis() + clockOffsetMs);
         envelope.put("logical_clock", logicalClock);
@@ -175,8 +181,14 @@ public class Server {
 
     private static void observeMessage(Map<String, Object> envelope) {
         Object value = envelope.get("logical_clock");
-        if (value instanceof Number) {
-            logicalClock = Math.max(logicalClock, ((Number) value).longValue());
+        // So inteiros de ate 64 bits com sinal. BigInteger (uint64 > Long.MAX),
+        // Double e Boolean caem fora e sao ignorados.
+        if (value instanceof Byte || value instanceof Short
+                || value instanceof Integer || value instanceof Long) {
+            long received = ((Number) value).longValue();
+            if (received >= 0 && received <= MAX_LOGICAL_CLOCK) {
+                logicalClock = Math.max(logicalClock, received);
+            }
         }
     }
 
