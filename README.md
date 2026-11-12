@@ -1,15 +1,13 @@
 # vet_flow — Sistema Distribuído de Mensagens (Clínica Veterinária)
 
-> **Status do código:** Partes 1 e 2 implementadas; Parte 3 implementada nesta branch.
+> **Status do código:** Partes 1, 2 e 3 implementadas e validadas em Docker
+> (Python e Java, com interoperabilidade entre as linguagens).
 > Parte 1: login, criação e listagem de canais, com persistência em disco.
-> Parte 2: Pub/Sub via broker (`XSUB` 5557 / `XPUB` 5558), com persistência
-> das mensagens publicadas. Ambas em **Python e Java**, com
-> interoperabilidade entre as linguagens. Os bots agora também têm o modo
-> contínuo exigido pelo enunciado (`ACTION=BOT_LOOP`). A Parte 3 adiciona
-> relógios lógicos, heartbeat e serviço de referência. A validação ponta a
-> ponta de Docker/Maven ainda precisa ser executada em uma máquina com essas
-> ferramentas instaladas; os resultados locais desta branch estão anotados
-> ao fim deste README.
+> Parte 2: Pub/Sub via broker (`XSUB` 5557 / `XPUB` 5558), com persistência das
+> mensagens publicadas e bots padronizados (`ACTION=BOT_LOOP`).
+> Parte 3: relógios lógicos, serviço de referência (rank, lista de servidores e
+> heartbeat) e broker REQ/REP com round-robin entre os servidores.
+> A Parte 4 (eleição e Berkeley) ainda **não** está implementada.
 
 ## Objetivo
 
@@ -67,6 +65,24 @@ parte é implementada.
 - Limitação conhecida: o ZeroMQ faz *prefix match* no tópico (um subscriber
   de `vac` também recebe `vacinas`).
 
+## O que já está implementado (Parte 3 — relógios, referência e heartbeat)
+
+- **Relógio lógico** em bots, servidores e Reference Service: o contador
+  incrementa antes de cada envio e, ao receber, assume o máximo entre o valor
+  local e o recebido. Todo envelope carrega `logical_clock` além do `timestamp`.
+- **Reference Service** (`reference/`, porta 5559, REQ/REP MessagePack):
+  atribui um rank estável por nome (`REFERENCE_REGISTER_REQUEST`), lista os
+  servidores disponíveis (`REFERENCE_LIST_REQUEST`) e renova a disponibilidade a
+  cada heartbeat (`REFERENCE_HEARTBEAT_REQUEST`).
+- **Heartbeat:** cada servidor o envia a cada 10 mensagens de clientes recebidas
+  (`HEARTBEAT_EVERY`). A resposta traz `reference_time_ms`, usado para ajustar o
+  deslocamento do relógio físico do servidor. Sem heartbeat por 30 s o servidor
+  sai da lista, mas mantém o rank ao voltar.
+- **Broker REQ/REP** (`broker-reqrep/`): `ROUTER` (5555, bots) e `DEALER` (5556,
+  servidores), com round-robin entre os servidores. Ver "Brokers".
+- **Logs completos** de tudo que é enviado e recebido, inclusive as trocas
+  servidor-Reference e a publicação no tópico.
+
 ## Estrutura de diretórios
 
 ```
@@ -74,6 +90,13 @@ projeto/
 ├── .gitignore
 ├── .env.example
 ├── README.md
+├── docker-compose.yml
+├── broker/                # proxy Pub/Sub (XSUB 5557 / XPUB 5558)
+│   ├── broker.py
+│   └── Dockerfile
+├── broker-reqrep/         # broker REQ/REP (ROUTER 5555 / DEALER 5556)
+│   ├── broker_reqrep.py
+│   └── Dockerfile
 ├── reference/
 │   ├── reference.py       # serviço de referência (Parte 3)
 │   ├── registry.py        # ranks e leases de heartbeat
@@ -82,25 +105,14 @@ projeto/
 │   └── PROTOCOL.md        # contrato comum de mensagens Python <-> Java
 ├── tests/
 │   ├── test_publish_validation.py   # contrato do PUBLISH_REQUEST (qualquer servidor)
-│   └── test_part3.py                # ranks e disponibilidade
+│   ├── test_part3.py                # ranks e disponibilidade
+│   └── list_servers.py              # consulta a lista de servidores no Reference
 ├── python/
-│   ├── server/
-│   │   ├── server.py
-│   │   ├── persistence.py
-│   │   └── requirements.txt
-│   └── client/
-│       ├── client.py
-│       └── requirements.txt
+│   ├── server/            # server.py, persistence.py, requirements.txt, Dockerfile
+│   └── client/            # client.py, requirements.txt, Dockerfile
 └── java/
-    ├── server/
-    │   ├── pom.xml
-    │   └── src/main/java/com/vetflow/server/
-    │       ├── Server.java
-    │       └── Persistence.java
-    └── client/
-        ├── pom.xml
-        └── src/main/java/com/vetflow/client/
-            └── Client.java
+    ├── server/            # pom.xml, Dockerfile, src/main/java/com/vetflow/server/{Server,Persistence}.java
+    └── client/            # pom.xml, Dockerfile, src/main/java/com/vetflow/client/Client.java
 ```
 
 ## Dependências (Java)
@@ -161,6 +173,10 @@ obrigatória — todas têm valor padrão seguro no código.
 | `REFERENCE_RETRY_INITIAL_SECONDS` | server | `1` | Intervalo inicial entre tentativas de registro quando o Reference está indisponível |
 | `REFERENCE_RETRY_MAX_SECONDS` | server | `10` | Teto do backoff (o intervalo dobra a cada falha até este valor) |
 | `REFERENCE_TIMEOUT_SECONDS` | reference | `30` | Tempo sem heartbeat para remover servidor da lista disponível |
+| `REFERENCE_BIND_ADDRESS` | reference | `tcp://*:5559` | Endereço de bind do serviço de referência |
+| `REQREP_FRONTEND_BIND` | broker-reqrep | `tcp://*:5555` | Bind do `ROUTER` (lado dos bots) |
+| `REQREP_BACKEND_BIND` | broker-reqrep | `tcp://*:5556` | Bind do `DEALER` (lado dos servidores) |
+| `BROKER_XSUB_BIND` / `BROKER_XPUB_BIND` | broker | `tcp://*:5557` / `tcp://*:5558` | Binds do proxy Pub/Sub |
 
 O projeto **não** usa `python-dotenv` — as variáveis são lidas diretamente
 via `os.environ.get(...)`. Para usá-las, exporte-as no shell antes de rodar
@@ -273,6 +289,16 @@ lista de disponíveis é uma lease em memória: após **30 segundos** sem
 heartbeat o servidor sai da lista, mas conserva o mesmo rank ao se registrar
 novamente. Esse limite pode ser alterado com `REFERENCE_TIMEOUT_SECONDS`.
 
+**Ranks em memória.** Os ranks vivem apenas na memória do Reference: são estáveis
+enquanto ele está no ar, mas se o Reference reiniciar a numeração recomeça pelo
+primeiro servidor que se registrar. Isso é aceitável nesta parte do projeto.
+
+**Precisão do ajuste de relógio.** O deslocamento é `hora_de_referência − hora_local`
+no instante da resposta e **não compensa a latência** da troca. Como no Docker
+todos os containers compartilham o mesmo relógio, o deslocamento real é ~0 ms e o
+valor observado nos logs (de −1 a −300 ms) é só latência e atraso da JVM. A
+sincronização muda na Parte 4 (coordenador eleito, algoritmo de Berkeley).
+
 **Resiliência frente a um Reference indisponível.** O servidor não fica preso a
 ele: a troca com o Reference tem timeout curto (`REFERENCE_TIMEOUT_MS`, padrão
 1000 ms); depois de uma falha de comunicação o socket `REQ` é **recriado** (um
@@ -353,28 +379,43 @@ Todo envio e recebimento é impresso com o conteúdo completo do envelope:
 docker compose up --build
 ```
 
-Os serviços de servidor e referência ficam ativos. Os bots de demonstração
-de ações únicas terminam; `bot-loop-python` e `bot-loop-java` continuam
-publicando conforme o enunciado. Para encerrar, use `Ctrl+C` e depois:
+O Compose sobe `reference-service`, `broker` (Pub/Sub), `reqrep-broker`,
+`python-server`, `java-server` e os bots. Os bots de demonstração de ação única
+terminam com `exit code 0`; `bot-loop-python` e `bot-loop-java` seguem publicando
+(fluxo padronizado do enunciado), então o `up` permanece ativo até `Ctrl+C`.
+Para rodar em segundo plano use `docker compose up -d` e `docker compose logs -f <serviço>`.
+
+Os dados persistem em `python/server/data/` e `java/server/data/` (bind mount) e
+**não** devem ser versionados (estão no `.gitignore`). Como eles sobrevivem ao
+`docker compose down`, uma segunda execução sem limpar faz os bots de criação
+receberem `canal já existe` e os publishers de demonstração não rodam. Para
+recomeçar do zero:
 
 ```powershell
 docker compose down
+Remove-Item -Force .\python\server\data\*.msgpack, .\java\server\data\*.msgpack -ErrorAction SilentlyContinue
+docker compose up --build
 ```
 
-Os dados persistidos ficam em `python/server/data/` e `java/server/data/`.
-Para recomeçar sem os dados antigos, remova os arquivos `.msgpack` desses
-diretórios no host.
+## Validação da Parte 3
 
-### Verificações executadas nesta branch
+Executada em Docker Desktop (Windows), com build limpo e sem dados residuais:
 
-- `[EXEC-SANDBOX]` `python -m compileall -q python reference tests` — passou.
-- `[EXEC-SANDBOX]` `python -m unittest discover -s tests -p 'test_part3.py' -v` — 3 testes do registro/heartbeat passaram.
-- `[EXEC-SANDBOX]` leitura do `docker-compose.yml` com PyYAML — sintaxe válida.
-- `[PENDENTE]` Docker Compose ponta a ponta: o comando `docker` não está instalado neste ambiente.
-- `[PENDENTE]` builds Java: Maven e `javac` não estão instalados neste ambiente.
-- `[PENDENTE]` teste existente `tests/test_publish.py`: depende de `pyzmq`, ausente neste ambiente.
+| Verificação | Como | Resultado |
+|---|---|---|
+| Subida e bots de um passo | `docker compose ps -a` | Todos os bots de login/canal/Pub-Sub terminaram com `Exited (0)`; bots de loop ativos |
+| Round-robin e interoperabilidade | `docker compose logs <servidor> \| Select-String "bot-<outra-linguagem>-loop"` | Cada servidor recebeu requisições dos bots de loop das **duas** linguagens |
+| Heartbeat | logs do `reference-service` | Cada servidor envia heartbeat a cada ~10 mensagens, com `rank` e `reference_time_ms` |
+| Rank estável | `docker compose restart java-server` | O servidor volta com o mesmo rank |
+| Expiração e retorno | `python tests\list_servers.py` antes/depois de `stop` + 35 s + `start` | Lista com os 2 servidores → só o Python → os 2 de volta, Java com rank 2 |
+| Relógio lógico | logs de bots e servidores | Valores crescem de forma coerente (envio incrementa, recebimento usa o máximo) |
+| Persistência | `docker compose down` e `up` sem apagar dados | Servidor carrega logins, canais e mensagens anteriores |
+| Testes unitários | `python -m unittest discover -s tests -p "test_part3.py" -v` | 3 testes passam |
 
-### Contrato de `PUBLISH_REQUEST` (Python e Java)
+`tests/list_servers.py` consulta o Reference (porta 5559 publicada no host);
+requer `pip install pyzmq msgpack`.
+
+## Teste de contrato do `PUBLISH_REQUEST` (Python e Java)
 
 `tests/test_publish_validation.py` fala só por sockets ZeroMQ, então o
 **mesmo script** testa o servidor Python ou o Java. Cobre string válida,
@@ -396,56 +437,33 @@ python tests\test_publish_validation.py --server tcp://localhost:5555 --broker t
 Sai com código 1 se algum caso falhar. Dependências: as mesmas do client
 Python (`pyzmq`, `msgpack`).
 
-## Docker
+## Demonstração Pub/Sub
 
-```bash
-docker compose up --build
-```
+O `docker-compose.yml` cria o canal `avisos-clinica` nos dois servidores, um
+publisher em cada servidor publica uma mensagem e dois subscribers (Python e Java)
+escutam o broker Pub/Sub; cada subscriber deve receber as duas mensagens. Os
+publishers esperam 8 s antes de publicar (`sleep` no `command`): o Pub/Sub do
+ZeroMQ não sinaliza "assinatura ativa" (*slow joiner*), e sem o atraso a
+mensagem poderia sair antes de o subscriber Java terminar de assinar. Em máquinas
+lentas, aumente esse valor.
 
-**Validado de ponta a ponta** (build limpo, sem dados residuais): sobe
-`python-server` e `java-server` (ficam de pé) e roda 6 bots
-automaticamente, sem nenhuma interação manual — login nas 4 combinações
-de linguagem, mais um canal criado por um bot Java no servidor Python e
-listado de volta por um bot Python. Todos os containers de bot terminam
-com `exit code 0`.
+## Limitações conhecidas
 
-Dados persistem em `python/server/data/` e `java/server/data/` no host
-(bind mount), sobrevivendo a `docker compose down`.
-
-**Nota:** como os dados sobrevivem no host, rodar a demonstração de novo
-sem limpar os dados vai fazer o `bot-channel-create` falhar com
-`canal já existe` (comportamento correto — é a regra de duplicidade
-funcionando). Para rodar do zero:
-
-```powershell
-docker compose down
-Remove-Item -Force .\python\server\data\*.msgpack -ErrorAction SilentlyContinue
-Remove-Item -Force .\java\server\data\*.msgpack -ErrorAction SilentlyContinue
-docker compose up --build
-```
-
-### Demonstração Docker original da Parte 2 (validada anteriormente)
-
-O `docker-compose.yml` também sobe o `broker` e 6 bots de Pub/Sub: o canal
-`avisos-clinica` é criado nos dois servidores, um publisher em cada servidor
-publica uma mensagem, e dois subscribers (Python e Java) escutam o broker.
-Na configuração original da Parte 2, cada subscriber recebeu as duas
-mensagens (uma de cada servidor) e os bots de demonstração terminaram com
-`exit code 0`. Nesta branch, o Compose também inicia os dois bots
-padronizados de execução contínua; por isso `docker compose up --build`
-permanece ativo até ser interrompido.
-
-Os publishers esperam 8s antes de publicar (`sleep` no `command` do
-compose): o Pub/Sub do ZeroMQ não tem sinal de "assinatura ativa" (*slow
-joiner*), e sem esse atraso a mensagem poderia sair antes do subscriber
-Java terminar de assinar. Em máquinas mais lentas, se um subscriber vier com
-menos mensagens, aumente esse valor.
-
-O aviso de dados antigos vale aqui também: se o canal `avisos-clinica` já
-existir nos dados persistidos, o bot de criação falha e os publishers não
-rodam. Limpe os `*.msgpack` conforme descrito acima antes de rodar de novo.
+- **Dados divergentes entre servidores (até a Parte 5):** o broker REQ/REP
+  distribui em round-robin e cada servidor guarda só parte dos dados. Um bot pode
+  listar canais em um servidor e publicar em outro que não conhece o canal
+  (`publicação recusada: canal ... nao existe`). Esperado; a replicação da
+  Parte 5 resolve.
+- **Prefix match no Pub/Sub:** assinar `vac` também recebe `vacinas`.
+- **Ajuste de relógio sem compensação de latência** (ver Parte 3); substituído na Parte 4.
+- **Ranks em memória** no Reference.
+- **Servidor parado:** uma requisição que o broker entregar a um servidor caído
+  expira no bot (`RECV_TIMEOUT_MS`) e o bot de loop pode encerrar. Tratar isso
+  entra junto com a tolerância a falhas das próximas partes.
 
 ## Próximos passos
 
-1. Executar `docker compose up --build` e validar a interoperabilidade nesta branch.
-2. Continuar com a Parte 4 (eleição de coordenador e algoritmo de Berkeley).
+Parte 4: eleição de coordenador (valentão/*bully*, com `REQ: eleição` entre
+servidores e anúncio no tópico `servers`), sincronização de relógio a cada 15
+mensagens com o coordenador (Berkeley simplificado) e remoção da hora do
+heartbeat no Reference. Parte 5: replicação dos dados entre todos os servidores.
