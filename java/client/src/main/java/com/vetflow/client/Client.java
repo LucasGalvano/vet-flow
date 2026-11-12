@@ -8,10 +8,12 @@ import org.zeromq.ZMQ;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 
 /** Bot Java compatível com o cliente Python e com o protocolo MessagePack. */
 public class Client {
@@ -71,16 +73,22 @@ public class Client {
             String safeName = BOT_NAME.toLowerCase().replaceAll("[^a-z0-9_-]", "-");
             if (safeName.length() > 30) safeName = safeName.substring(0, 30);
             int attempt = 0;
-            while (channels.size() < 5 && attempt < 20) {
+            // Com o broker REQ/REP (round-robin) a listagem e a criacao podem cair em
+            // servidores diferentes; por isso tambem contamos os canais que ESTE bot criou.
+            Set<String> createdNames = new HashSet<>();
+            while (knownCount(channels, createdNames) < 5 && attempt < 20) {
                 String name = "canal-" + safeName + "-" + (attempt + 1);
                 Map<String, Object> created = exchange(req, buildEnvelope("CHANNEL_CREATE_REQUEST",
                         Map.of("channel_name", name, "bot_name", BOT_NAME)));
-                if (!isOk(created)) {
+                if (isOk(created)) {
+                    createdNames.add(name);
+                } else {
                     System.out.println("[CLIENT] canal não criado: " + error(created));
                 }
                 channels = requestChannels(req);
                 attempt++;
             }
+            if (channels.isEmpty()) channels = new ArrayList<>(createdNames);
             if (channels.isEmpty()) throw new IllegalStateException("servidor sem canais");
 
             List<String> shuffled = new ArrayList<>(channels);
@@ -92,6 +100,8 @@ public class Client {
 
             Random random = new Random();
             while (true) {
+                List<String> fresh = requestChannels(req); // canais de outros bots entram no sorteio
+                if (!fresh.isEmpty()) channels = fresh;
                 String channel = channels.get(random.nextInt(channels.size()));
                 for (int i = 1; i <= 10; i++) {
                     String message = BOT_NAME + ": mensagem " + i + " no canal " + channel;
@@ -102,6 +112,12 @@ public class Client {
                 }
             }
         }
+    }
+
+    private static int knownCount(List<String> channels, Set<String> created) {
+        Set<String> all = new HashSet<>(channels);
+        all.addAll(created);
+        return all.size();
     }
 
     private static List<String> requestChannels(ZMQ.Socket req) throws Exception {

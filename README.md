@@ -154,6 +154,7 @@ obrigatória — todas têm valor padrão seguro no código.
 | `CHANNELS` | client | valor de `CHANNEL_NAME` | Lista separada por vírgulas de canais para `ACTION=SUBSCRIBE` |
 | `BOT_DELAY_SECONDS` | client | `1` | Pausa entre publicações de `ACTION=BOT_LOOP` |
 | `REFERENCE_ADDRESS` | server | `tcp://localhost:5559` | Endereço do serviço de referência |
+| `SERVER_BROKER_ADDRESS` | server | _(vazio)_ | Backend do broker REQ/REP (ex.: `tcp://reqrep-broker:5556`). Se vazio, o servidor só faz `bind` |
 | `SERVER_NAME` | server | nome da implementação | Nome único usado no registro e heartbeat |
 | `HEARTBEAT_EVERY` | server | `10` | Mensagens de clientes entre heartbeats |
 | `REFERENCE_TIMEOUT_MS` | server | `1000` | Quanto o servidor espera a resposta do Reference Service em cada troca (registro/heartbeat). **Não confundir** com `REFERENCE_TIMEOUT_SECONDS`, que é do lado do Reference |
@@ -304,6 +305,47 @@ mensagens, escolhendo canal aleatoriamente e aguardando 1 segundo entre
 publicações. `ACTION=SUBSCRIBE` também aceita vários canais em `CHANNELS`
 separados por vírgula. O log de recebimento exibe canal, mensagem,
 timestamp de envio e timestamp local de recebimento.
+
+## Escolhas de projeto
+
+- **Linguagens:** Python e Java. Cada uma tem cliente (bot) e servidor completos,
+  e todos falam o mesmo protocolo (ver `protocol/PROTOCOL.md`). O projeto é
+  individual, então as duas linguagens atendem ao requisito mínimo.
+- **Troca de mensagens:** ZeroMQ. REQ/REP entre bots e servidores (passando pelo
+  broker REQ/REP) e entre servidores e Reference Service; PUB/SUB para a
+  distribuição das publicações (proxy XSUB/XPUB).
+- **Serialização:** MessagePack (binário) em todas as mensagens. Cada envelope
+  tem `type`, `sender_id`, `sender_lang`, `timestamp` (ms, físico) e
+  `logical_clock`.
+- **Persistência:** cada servidor tem o seu diretório de dados, com três
+  arquivos MessagePack (`logins`, `channels`, `messages`), cada um contendo uma
+  lista de registros. A escrita é atômica (arquivo temporário + rename) e um
+  arquivo corrompido é preservado como `*.corrupt` em vez de ser sobrescrito.
+
+## Brokers
+
+O projeto tem **dois** brokers independentes:
+
+- `broker-reqrep/`: `ROUTER` (porta 5555, lado dos bots) e `DEALER` (porta 5556,
+  lado dos servidores) ligados por `zmq.proxy`. O `DEALER` distribui as
+  requisições dos bots entre os servidores em **round-robin**. Os servidores
+  mantêm o `bind` na 5555 e fazem também `connect` no backend
+  (`SERVER_BROKER_ADDRESS`), de modo que os bots de demonstração de um passo
+  continuam podendo falar direto com um servidor específico.
+- `broker/`: proxy Pub/Sub, `XSUB` 5557 / `XPUB` 5558.
+
+**Limitação até a Parte 5:** como cada servidor guarda só uma parte dos dados,
+um bot de loop que passa pelo broker REQ/REP pode listar canais em um servidor
+e publicar em outro que não conhece o canal. Isso aparece nos logs como
+`publicação recusada: canal ... nao existe`. É esperado e será resolvido pela
+replicação da Parte 5.
+
+## Logs
+
+Todo envio e recebimento é impresso com o conteúdo completo do envelope:
+`[SEND]`/`[RECV]` (cliente-servidor), `[REF-SEND]`/`[REF-RECV]`
+(servidor-Reference), `[PUB-SEND]` (publicação no tópico) e `[PUBSUB-RECV]`
+(bot recebendo, com `timestamp_envio` e `timestamp_recebimento`).
 
 ## Execução Docker
 

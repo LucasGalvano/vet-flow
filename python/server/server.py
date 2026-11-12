@@ -38,6 +38,9 @@ MESSAGES_PATH = os.environ.get(
 # PUB nele para publicar mensagens. Processo separado, ver broker/broker.py.
 BROKER_XSUB_ADDRESS = os.environ.get("BROKER_XSUB_ADDRESS", "tcp://localhost:5557")
 REFERENCE_ADDRESS = os.environ.get("REFERENCE_ADDRESS", "tcp://localhost:5559")
+# Backend do broker REQ/REP (ROUTER/DEALER). Opcional: se definido, o REP tambem
+# se CONECTA ao broker (alem do bind), e passa a receber requisicoes em round-robin.
+SERVER_BROKER_ADDRESS = os.environ.get("SERVER_BROKER_ADDRESS", "")
 SERVER_NAME = os.environ.get("SERVER_NAME", "python-server")
 HEARTBEAT_EVERY = int(os.environ.get("HEARTBEAT_EVERY", "10"))
 # Resiliencia frente a um Reference Service indisponivel (ver CONTEXTO.md, D24):
@@ -134,6 +137,7 @@ def reset_reference_socket() -> None:
 def reference_request(msg_type: str, payload: dict) -> dict:
     """Troca uma mensagem MessagePack com o Reference Service."""
     request = build_envelope(msg_type, payload)
+    print(f"[REF-SEND] {request}")
     try:
         reference_socket.send(msgpack.packb(request, use_bin_type=True))
         raw_response = reference_socket.recv()
@@ -142,6 +146,7 @@ def reference_request(msg_type: str, payload: dict) -> dict:
         raise
     response = msgpack.unpackb(raw_response, raw=False)
     observe_message(response)
+    print(f"[REF-RECV] {response}")
     response_payload = response.get("payload") or {}
     reference_time = response_payload.get("reference_time_ms")
     if isinstance(reference_time, int):
@@ -344,6 +349,7 @@ def handle_publish_request(envelope: dict) -> dict:
     )
     topic = channel_name.encode("utf-8")
     body = msgpack.packb(publish_envelope, use_bin_type=True)
+    print(f"[PUB-SEND] topic={channel_name} {publish_envelope}")
     if pub_socket is not None:
         try:
             pub_socket.send_multipart([topic, body])
@@ -401,6 +407,9 @@ def main():
     socket.setsockopt(zmq.RCVTIMEO, IDLE_TICK_MS)
     socket.bind(BIND_ADDRESS)
     print(f"[SERVER] Python Server (REP) ouvindo em {BIND_ADDRESS}")
+    if SERVER_BROKER_ADDRESS:
+        socket.connect(SERVER_BROKER_ADDRESS)
+        print(f"[SERVER] REP tambem conectado ao broker REQ/REP em {SERVER_BROKER_ADDRESS}")
 
     # PUB conectado ao broker (Parte 2). "connect", nao "bind": quem faz
     # bind e o broker (XSUB), o servidor so se conecta nele.

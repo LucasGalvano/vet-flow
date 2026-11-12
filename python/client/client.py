@@ -142,15 +142,22 @@ def run_bot_loop(context):
     channels = channel_list(req)
     base = re.sub(r"[^a-zA-Z0-9_-]", "-", BOT_NAME).lower()[:30]
     attempt = 0
-    while len(channels) < 5 and attempt < 20:
+    # Com o broker REQ/REP (round-robin) a listagem e a criacao podem cair em
+    # servidores diferentes; por isso tambem contamos os canais que ESTE bot criou.
+    created_names = set()
+    while len(set(channels) | created_names) < 5 and attempt < 20:
         name = f"canal-{base}-{attempt + 1}"
         response = request(req, "CHANNEL_CREATE_REQUEST", {
             "channel_name": name, "bot_name": BOT_NAME,
         })
-        if not payload_ok(response):
+        if payload_ok(response):
+            created_names.add(name)
+        else:
             print(f"[CLIENT] canal não criado: {(response.get('payload') or {}).get('error_msg')}")
         channels = channel_list(req)
         attempt += 1
+    if not channels:
+        channels = sorted(created_names)
     if not channels:
         raise RuntimeError("servidor não possui canais para publicar")
 
@@ -158,6 +165,9 @@ def run_bot_loop(context):
     stop, thread = run_subscribe(context, subscribed)
     try:
         while True:
+            fresh = channel_list(req)  # canais criados por outros bots entram no sorteio
+            if fresh:
+                channels = fresh
             channel = random.choice(channels)
             for index in range(1, 11):
                 message = f"{BOT_NAME}: mensagem {index} no canal {channel}"

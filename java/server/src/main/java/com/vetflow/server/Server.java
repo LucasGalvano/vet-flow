@@ -50,6 +50,10 @@ public class Server {
             System.getenv().getOrDefault("REFERENCE_ADDRESS", "tcp://localhost:5559");
     private static final String SERVER_NAME =
             System.getenv().getOrDefault("SERVER_NAME", "java-server");
+    // Backend do broker REQ/REP (ROUTER/DEALER). Opcional: se definido, o REP tambem
+    // se CONECTA ao broker (alem do bind) e passa a receber requisicoes em round-robin.
+    private static final String BROKER_BACKEND_ADDRESS =
+            System.getenv().getOrDefault("SERVER_BROKER_ADDRESS", "");
     private static final int HEARTBEAT_EVERY =
             Integer.parseInt(System.getenv().getOrDefault("HEARTBEAT_EVERY", "10"));
 
@@ -105,6 +109,11 @@ public class Server {
             socket.setReceiveTimeOut(IDLE_TICK_MS);
             socket.bind(BIND_ADDRESS);
             System.out.println("[SERVER] Java Server (REP) ouvindo em " + BIND_ADDRESS);
+            if (!BROKER_BACKEND_ADDRESS.isEmpty()) {
+                socket.connect(BROKER_BACKEND_ADDRESS);
+                System.out.println("[SERVER] REP tambem conectado ao broker REQ/REP em "
+                        + BROKER_BACKEND_ADDRESS);
+            }
 
             // PUB conectado ao broker (Parte 2). "connect", nao "bind":
             // quem faz bind e o broker (XSUB), o servidor so se conecta.
@@ -266,6 +275,7 @@ public class Server {
 
     private static Map<String, Object> referenceRequest(String type, Map<String, Object> payload) throws Exception {
         Map<String, Object> request = buildEnvelope(type, payload);
+        System.out.println("[REF-SEND] " + request);
         byte[] raw;
         try {
             if (referenceSocket == null) {
@@ -285,6 +295,7 @@ public class Server {
         }
         Map<String, Object> response = MAPPER.readValue(raw, Map.class);
         observeMessage(response);
+        System.out.println("[REF-RECV] " + response);
         Map<String, Object> result = (Map<String, Object>) response.get("payload");
         if (result == null || !"OK".equals(result.get("status"))) {
             throw new IllegalStateException("Reference Service: " + (result == null ? "resposta inválida" : result.get("error_msg")));
@@ -440,6 +451,7 @@ public class Server {
         try {
             byte[] topic = channelName.getBytes("UTF-8");
             byte[] body = MAPPER.writeValueAsBytes(publishEnvelope);
+            System.out.println("[PUB-SEND] topic=" + channelName + " " + publishEnvelope);
             pubSocket.sendMore(topic);
             pubSocket.send(body, 0);
         } catch (Exception e) {

@@ -1,5 +1,5 @@
-# Orquestracao das Partes 1, 2 e 3: 2 servidores, referência, broker
-# Pub/Sub e bots que demonstram login, canais e publicacao/assinatura,
+# Orquestracao das Partes 1, 2 e 3: 2 servidores, referência, broker REQ/REP,
+# broker Pub/Sub e bots que demonstram login, canais e publicacao/assinatura,
 # incluindo interoperabilidade cruzada entre as duas linguagens -- tudo
 # automatico, sem interacao manual.
 #
@@ -20,17 +20,25 @@ services:
       - "5557:5557"
       - "5558:5558"
 
+  # Broker REQ/REP (ROUTER/DEALER): bots -> 5555 (frontend); servidores se conectam
+  # em 5556 (backend). O DEALER distribui as requisicoes em round-robin.
+  reqrep-broker:
+    build: ./broker-reqrep
+
   python-server:
     build: ./python/server
     environment:
       BROKER_XSUB_ADDRESS: tcp://broker:5557
       REFERENCE_ADDRESS: tcp://reference-service:5559
       SERVER_NAME: python-server
+      SERVER_BROKER_ADDRESS: tcp://reqrep-broker:5556
     ports:
       - "5555:5555"
     volumes:
       - ./python/server/data:/app/data
     depends_on:
+      reqrep-broker:
+        condition: service_started
       broker:
         condition: service_started
       reference-service:
@@ -42,11 +50,14 @@ services:
       BROKER_XSUB_ADDRESS: tcp://broker:5557
       REFERENCE_ADDRESS: tcp://reference-service:5559
       SERVER_NAME: java-server
+      SERVER_BROKER_ADDRESS: tcp://reqrep-broker:5556
     ports:
       - "5556:5555"
     volumes:
       - ./java/server/data:/app/data
     depends_on:
+      reqrep-broker:
+        condition: service_started
       broker:
         condition: service_started
       reference-service:
@@ -216,14 +227,18 @@ services:
   bot-loop-python:
     build: ./python/client
     environment:
-      SERVER_ADDRESS: tcp://python-server:5555
+      SERVER_ADDRESS: tcp://reqrep-broker:5555
       BROKER_ADDRESS: tcp://broker:5558
       BOT_NAME: bot-python-loop
       ACTION: BOT_LOOP
       BOT_DELAY_SECONDS: "1"
       RECV_TIMEOUT_MS: "15000"
     depends_on:
+      reqrep-broker:
+        condition: service_started
       python-server:
+        condition: service_started
+      java-server:
         condition: service_started
       broker:
         condition: service_started
@@ -231,13 +246,17 @@ services:
   bot-loop-java:
     build: ./java/client
     environment:
-      SERVER_ADDRESS: tcp://java-server:5555
+      SERVER_ADDRESS: tcp://reqrep-broker:5555
       BROKER_ADDRESS: tcp://broker:5558
       BOT_NAME: bot-java-loop
       ACTION: BOT_LOOP
       BOT_DELAY_SECONDS: "1"
       RECV_TIMEOUT_MS: "15000"
     depends_on:
+      reqrep-broker:
+        condition: service_started
+      python-server:
+        condition: service_started
       java-server:
         condition: service_started
       broker:

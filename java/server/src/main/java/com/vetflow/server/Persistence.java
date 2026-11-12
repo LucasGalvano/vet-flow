@@ -6,8 +6,10 @@ import org.msgpack.jackson.dataformat.MessagePackFactory;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -59,6 +61,13 @@ public class Persistence {
             // comeca com lista vazia. Mesma decisao conservadora do lado
             // Python (ver persistence.py).
             System.err.println("[PERSISTENCE] Falha ao ler '" + path + "': " + e.getMessage());
+            // Preserva o arquivo ruim: sem isso a proxima escrita sobrescreveria o historico.
+            try {
+                Files.move(file.toPath(), Paths.get(path + ".corrupt"),
+                        StandardCopyOption.REPLACE_EXISTING);
+            } catch (IOException ignored) {
+                // melhor esforco
+            }
             return new ArrayList<>();
         }
     }
@@ -70,7 +79,17 @@ public class Persistence {
                 Files.createDirectories(parent);
             }
             byte[] packed = MAPPER.writeValueAsBytes(items);
-            Files.write(Paths.get(path), packed);
+            // Escrita atomica: temporario + rename (uma queda no meio nunca
+            // deixa o arquivo real truncado).
+            Path target = Paths.get(path);
+            Path tmp = Paths.get(path + ".tmp");
+            Files.write(tmp, packed);
+            try {
+                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING,
+                        StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
+            }
         } catch (IOException e) {
             throw new RuntimeException("Falha ao gravar '" + path + "'", e);
         }
