@@ -43,6 +43,26 @@ REFERENCE_ADDRESS = os.environ.get("REFERENCE_ADDRESS", "tcp://localhost:5559")
 SERVER_BROKER_ADDRESS = os.environ.get("SERVER_BROKER_ADDRESS", "")
 SERVER_NAME = os.environ.get("SERVER_NAME", "python-server")
 HEARTBEAT_EVERY = int(os.environ.get("HEARTBEAT_EVERY", "10"))
+
+# --- Parte 4: eleicao (bully) e sincronizacao de relogio com o coordenador ---
+# Mensagens de clientes entre duas sincronizacoes com o coordenador.
+SYNC_EVERY = int(os.environ.get("SYNC_EVERY", "15"))
+# XPUB do broker Pub/Sub: o servidor assina o topico `servers` para saber quem e o coordenador.
+BROKER_XPUB_ADDRESS = os.environ.get("BROKER_XPUB_ADDRESS", "tcp://localhost:5558")
+# Porta em que os servidores atendem uns aos outros (a mesma do REP: 5555). O endereco de
+# um par e tcp://<nome do servidor>:PEER_PORT (o nome registrado no Reference e o hostname).
+PEER_PORT = int(os.environ.get("PEER_PORT", "5555"))
+PEER_TIMEOUT_MS = max(1, int(os.environ.get("PEER_TIMEOUT_MS", "1000")))
+# Quanto esperar o anuncio do coordenador depois que um servidor de rank maior respondeu OK.
+ELECTION_WAIT_SECONDS = float(os.environ.get("ELECTION_WAIT_SECONDS", "5"))
+# O coordenador republica o anuncio periodicamente: o Pub/Sub nao garante entrega a quem
+# acabou de assinar (slow joiner) e isso tambem corrige coordenadores divergentes.
+ANNOUNCE_EVERY_SECONDS = float(os.environ.get("COORDINATOR_ANNOUNCE_SECONDS", "5"))
+# Desvio artificial do relogio local (para demonstrar a sincronizacao: no Docker todos os
+# containers compartilham o mesmo relogio fisico).
+CLOCK_SKEW_MS = int(os.environ.get("CLOCK_SKEW_MS", "0"))
+SERVERS_TOPIC = "servers"
+PEER_TYPES = ("ELECTION_REQUEST", "CLOCK_REQUEST")
 # Resiliencia frente a um Reference Service indisponivel (ver CONTEXTO.md, D24):
 #  - timeout de cada troca com o Reference (antes fixo em 5000 ms);
 #  - tentativas explicitas de registro, com intervalo inicial e backoff
@@ -67,7 +87,16 @@ known_channels = []
 pub_socket = None
 reference_socket = None
 logical_clock = 0
-clock_offset_ms = 0
+clock_adjust_ms = 0  # ajuste acumulado pela sincronizacao com o coordenador
+# Parte 4
+coordinator = None  # nome do servidor eleito coordenador (None = desconhecido)
+election_due = False
+election_not_before = 0.0
+awaiting_announcement_until = None  # monotonic; None = nao esta esperando anuncio
+announce_due = False
+next_announcement_at = 0.0
+sync_due = False
+sub_socket = None
 client_messages_received = 0
 server_rank = None
 zmq_context = None
@@ -76,8 +105,14 @@ registration_retry_delay = REFERENCE_RETRY_INITIAL_SECONDS
 next_registration_attempt = 0.0
 
 
+def local_clock_ms() -> int:
+    """Relogio local deste servidor (com o desvio simulado CLOCK_SKEW_MS)."""
+    return int(time.time() * 1000) + CLOCK_SKEW_MS
+
+
 def physical_timestamp_ms() -> int:
-    return int(time.time() * 1000) + clock_offset_ms
+    """Hora fisica usada nos timestamps: relogio local + ajuste do coordenador."""
+    return local_clock_ms() + clock_adjust_ms
 
 
 # Maior contador remoto aceito: Long.MAX_VALUE - 1, deixando folga para o +1 do
@@ -148,10 +183,6 @@ def reference_request(msg_type: str, payload: dict) -> dict:
     observe_message(response)
     print(f"[REF-RECV] {response}")
     response_payload = response.get("payload") or {}
-    reference_time = response_payload.get("reference_time_ms")
-    if isinstance(reference_time, int):
-        global clock_offset_ms
-        clock_offset_ms = reference_time - int(time.time() * 1000)
     if response_payload.get("status") != "OK":
         raise RuntimeError(response_payload.get("error_msg", "Reference Service error"))
     return response_payload
@@ -182,8 +213,7 @@ def try_register() -> bool:
     server_rank = registration.get("rank")
     reference_registered = True
     registration_retry_delay = REFERENCE_RETRY_INITIAL_SECONDS
-    print(f"[SERVER] registrado como {SERVER_NAME}, rank={server_rank}, "
-          f"hora ajustada em {clock_offset_ms}ms")
+    print(f"[SERVER] registrado como {SERVER_NAME}, rank={server_rank}")
     return True
 
 
@@ -201,11 +231,246 @@ def send_heartbeat() -> None:
         payload = reference_request(
             "REFERENCE_HEARTBEAT_REQUEST", {"server_name": SERVER_NAME}
         )
-        print(f"[HEARTBEAT] servidor={SERVER_NAME} rank={payload.get('rank')} "
-              f"offset={clock_offset_ms}ms")
+        print(f"[HEARTBEAT] servidor={SERVER_NAME} rank={payload.get('rank')}")
     except Exception as exc:
         print(f"[HEARTBEAT] falha ao sincronizar com referência: {exc}")
         schedule_registration_retry(exc)
+
+
+# ---------------------------------------------------------------------------
+# Parte 4: eleicao (bully) e sincronizacao de relogio com o coordenador
+#
+# Tudo roda no loop unico do REP (sem threads), como o resto do servidor:
+#  - ELECTION_REQUEST / CLOCK_REQUEST chegam no mesmo REP (porta 5555) e sao tratados
+#    por dispatch(); o servidor so inicia trocas com servidores de rank MAIOR (eleicao)
+#    ou com o coordenador (relogio), entao as esperas formam uma cadeia, nao um ciclo.
+#  - O anuncio do coordenador chega pelo topico `servers` (socket SUB no broker Pub/Sub).
+# ---------------------------------------------------------------------------
+
+def peer_request(name: str, msg_type: str, payload: dict) -> dict:
+    """REQ/REP direto com outro servidor. Socket descartavel por troca: um REQ que
+    estoura o timeout fica inutilizavel (mesma razao do Reference)."""
+    sock = zmq_context.socket(zmq.REQ)
+    sock.setsockopt(zmq.RCVTIMEO, PEER_TIMEOUT_MS)
+    sock.setsockopt(zmq.SNDTIMEO, PEER_TIMEOUT_MS)
+    sock.setsockopt(zmq.LINGER, 0)
+    try:
+        sock.connect(f"tcp://{name}:{PEER_PORT}")
+        request = build_envelope(msg_type, payload)
+        print(f"[PEER-SEND] para={name} {request}")
+        sock.send(msgpack.packb(request, use_bin_type=True))
+        response = msgpack.unpackb(sock.recv(), raw=False)
+    finally:
+        sock.close()
+    observe_message(response)
+    print(f"[PEER-RECV] de={name} {response}")
+    return response
+
+
+def other_servers() -> list:
+    """Servidores disponiveis segundo o Reference, exceto este."""
+    payload = reference_request("REFERENCE_LIST_REQUEST", {})
+    return [s for s in payload.get("servers", []) if s.get("name") != SERVER_NAME]
+
+
+def announce_coordinator() -> None:
+    """Publica no topico `servers` o nome do coordenador."""
+    global announce_due, next_announcement_at
+    announce_due = False
+    next_announcement_at = time.monotonic() + ANNOUNCE_EVERY_SECONDS
+    envelope = build_envelope(
+        "COORDINATOR_ANNOUNCEMENT", {"coordinator": SERVER_NAME, "rank": server_rank}
+    )
+    print(f"[PUB-SEND] topic={SERVERS_TOPIC} {envelope}")
+    try:
+        pub_socket.send_multipart([
+            SERVERS_TOPIC.encode("utf-8"),
+            msgpack.packb(envelope, use_bin_type=True),
+        ])
+    except Exception as exc:
+        print(f"[ERROR] Falha ao anunciar o coordenador: {exc}")
+
+
+def become_coordinator() -> None:
+    global coordinator, awaiting_announcement_until
+    coordinator = SERVER_NAME
+    awaiting_announcement_until = None
+    print(f"[COORDENADOR] {SERVER_NAME} (rank {server_rank}) eleito coordenador")
+    announce_coordinator()
+
+
+def run_election() -> None:
+    """Eleicao pelo algoritmo do valentao (bully): pede eleicao aos servidores de rank
+    maior. Se algum responde OK, espera o anuncio dele; se nenhum responde, este servidor
+    e o novo coordenador."""
+    global election_due, election_not_before, coordinator, awaiting_announcement_until
+    election_due = False
+    if not isinstance(server_rank, int):
+        election_due = True
+        election_not_before = time.monotonic() + 1.0
+        return
+    try:
+        servers = other_servers()
+    except Exception as exc:
+        print(f"[ELEICAO] nao foi possivel listar os servidores no Reference: {exc}")
+        election_due = True
+        election_not_before = time.monotonic() + 1.0
+        return
+
+    higher = sorted(
+        (s for s in servers if isinstance(s.get("rank"), int) and s["rank"] > server_rank),
+        key=lambda s: s["rank"],
+    )
+    print(f"[ELEICAO] {SERVER_NAME} (rank {server_rank}) inicia eleicao; "
+          f"servidores de rank maior: {[s['name'] for s in higher]}")
+    for server in higher:
+        try:
+            response = peer_request(server["name"], "ELECTION_REQUEST", {"rank": server_rank})
+        except Exception as exc:
+            print(f"[ELEICAO] {server['name']} nao respondeu ({exc})")
+            continue
+        if (response.get("payload") or {}).get("status") == "OK":
+            coordinator = None
+            awaiting_announcement_until = time.monotonic() + ELECTION_WAIT_SECONDS
+            print(f"[ELEICAO] {server['name']} respondeu OK; aguardando o anuncio do coordenador")
+            return
+    become_coordinator()
+
+
+def handle_coordinator_announcement(envelope: dict) -> None:
+    global coordinator, awaiting_announcement_until, election_due, announce_due, sync_due
+    payload = envelope.get("payload") or {}
+    name = payload.get("coordinator")
+    rank = payload.get("rank")
+    if not isinstance(name, str) or name == SERVER_NAME:
+        return
+    if isinstance(rank, int) and isinstance(server_rank, int) and rank < server_rank:
+        # Anuncio de um servidor de rank menor (ex.: antigo coordenador que ainda nao sabe
+        # que um servidor maior voltou): este servidor deve assumir.
+        if coordinator == SERVER_NAME:
+            announce_due = True
+        else:
+            election_due = True
+        return
+    if coordinator != name:
+        print(f"[COORDENADOR] novo coordenador: {name} (rank {rank})")
+        sync_due = True  # sincroniza logo, sem esperar as proximas mensagens
+    coordinator = name
+    awaiting_announcement_until = None
+    election_due = False
+
+
+def drain_announcements() -> None:
+    """Le (sem bloquear) o que chegou no topico `servers`."""
+    while True:
+        try:
+            topic, body = sub_socket.recv_multipart(flags=zmq.NOBLOCK)
+        except zmq.Again:
+            return
+        try:
+            envelope = msgpack.unpackb(body, raw=False)
+            observe_message(envelope)
+            topic_name = topic.decode("utf-8")
+            print(f"[PUBSUB-RECV] topic={topic_name} {envelope}")
+            # O ZeroMQ casa topicos por prefixo: confere o nome inteiro.
+            if topic_name == SERVERS_TOPIC and envelope.get("type") == "COORDINATOR_ANNOUNCEMENT":
+                handle_coordinator_announcement(envelope)
+        except Exception as exc:
+            print(f"[ERROR] Falha ao processar mensagem do topico servers: {exc}")
+
+
+def sync_clock() -> None:
+    """Pede a hora ao coordenador e ajusta o relogio (compensando meia latencia). Se o
+    coordenador nao responde, ele e considerado indisponivel e uma eleicao e iniciada."""
+    global sync_due, clock_adjust_ms, coordinator, election_due
+    sync_due = False
+    if coordinator is None:
+        return  # sem coordenador conhecido; housekeeping() cuida da eleicao
+    if coordinator == SERVER_NAME:
+        print(f"[CLOCK-SYNC] {SERVER_NAME} e o coordenador: relogio de referencia "
+              f"(ajuste={clock_adjust_ms}ms)")
+        return
+    t0 = local_clock_ms()
+    try:
+        response = peer_request(coordinator, "CLOCK_REQUEST", {})
+    except Exception as exc:
+        print(f"[CLOCK-SYNC] coordenador {coordinator} indisponivel ({exc}); iniciando eleicao")
+        coordinator = None
+        election_due = True
+        return
+    t1 = local_clock_ms()
+    payload = response.get("payload") or {}
+    coordinator_time = payload.get("time_ms")
+    if payload.get("status") != "OK" or not isinstance(coordinator_time, int):
+        print(f"[CLOCK-SYNC] {coordinator} nao e mais o coordenador "
+              f"({payload.get('error_msg')}); iniciando eleicao")
+        coordinator = None
+        election_due = True
+        return
+    # A hora do coordenador foi lida, em media, no meio da troca (estimativa de Cristian).
+    new_adjust = coordinator_time + (t1 - t0) // 2 - t1
+    delta = new_adjust - clock_adjust_ms
+    clock_adjust_ms = new_adjust
+    print(f"[CLOCK-SYNC] coordenador={coordinator} rtt={t1 - t0}ms "
+          f"correcao={delta:+d}ms ajuste_total={clock_adjust_ms}ms")
+
+
+def handle_election_request(envelope: dict) -> dict:
+    """ELECTION_REQUEST de um servidor de rank menor: responde OK e assume a eleicao."""
+    global election_due, announce_due
+    sender_rank = (envelope.get("payload") or {}).get("rank")
+    if not (isinstance(sender_rank, int) and isinstance(server_rank, int)
+            and sender_rank > server_rank):
+        if coordinator == SERVER_NAME:
+            announce_due = True   # ja sou o coordenador: so reafirma
+        else:
+            election_due = True   # depois de responder, disputa a coordenacao
+    return build_envelope("ELECTION_RESPONSE", {"status": "OK", "rank": server_rank})
+
+
+def handle_clock_request(envelope: dict) -> dict:
+    """CLOCK_REQUEST: so o coordenador responde com a hora correta."""
+    if coordinator != SERVER_NAME:
+        return build_envelope("CLOCK_RESPONSE", {
+            "status": "ERROR",
+            "error_msg": "este servidor nao e o coordenador",
+            "coordinator": coordinator,
+        })
+    return build_envelope("CLOCK_RESPONSE", {"status": "OK", "time_ms": physical_timestamp_ms()})
+
+
+def housekeeping() -> None:
+    """Tarefas periodicas do loop principal: registro no Reference, eleicao, reanuncio do
+    coordenador e sincronizacao de relogio."""
+    global election_due, awaiting_announcement_until
+    maybe_register()
+    if not reference_registered:
+        return
+    now = time.monotonic()
+    if coordinator is None:
+        if awaiting_announcement_until is None:
+            election_due = True  # ninguem conhecido e nenhuma eleicao em andamento
+        elif now >= awaiting_announcement_until:
+            print("[ELEICAO] o anuncio do coordenador nao chegou a tempo; refazendo a eleicao")
+            awaiting_announcement_until = None
+            election_due = True
+    if election_due and now >= election_not_before:
+        run_election()
+    if coordinator == SERVER_NAME and (announce_due or time.monotonic() >= next_announcement_at):
+        announce_coordinator()
+    if sync_due:
+        sync_clock()
+        if election_due and time.monotonic() >= election_not_before:
+            run_election()  # o coordenador caiu durante a sincronizacao
+
+
+def after_client_message() -> None:
+    """Chamado depois de responder uma mensagem de cliente (nao atrasa a resposta)."""
+    global sync_due
+    if client_messages_received % HEARTBEAT_EVERY == 0:
+        send_heartbeat()
+    if client_messages_received % SYNC_EVERY == 0:
+        sync_due = True
 
 
 def handle_login_request(envelope: dict) -> dict:
@@ -252,6 +517,13 @@ def handle_channel_create_request(envelope: dict) -> dict:
         return build_envelope(
             "CHANNEL_CREATE_RESPONSE",
             {"status": "ERROR", "error_msg": "campo 'bot_name' ausente ou vazio"},
+        )
+
+    # `servers` e o topico do anuncio do coordenador (Parte 4): nao pode virar canal.
+    if channel_name == SERVERS_TOPIC:
+        return build_envelope(
+            "CHANNEL_CREATE_RESPONSE",
+            {"status": "ERROR", "error_msg": f"nome de canal reservado: '{SERVERS_TOPIC}'"},
         )
 
     # Nome duplicado e tratado como erro (comparacao exata, case-sensitive).
@@ -381,6 +653,13 @@ def dispatch(envelope: dict) -> dict:
     if msg_type == "PUBLISH_REQUEST":
         return handle_publish_request(envelope)
 
+    # Parte 4: trocas entre servidores.
+    if msg_type == "ELECTION_REQUEST":
+        return handle_election_request(envelope)
+
+    if msg_type == "CLOCK_REQUEST":
+        return handle_clock_request(envelope)
+
     # Tipo desconhecido nao deve derrubar o servidor (REP exige sempre 1
     # send() por recv(), senao o socket trava em estado inconsistente).
     return build_envelope(
@@ -390,7 +669,7 @@ def dispatch(envelope: dict) -> dict:
 
 
 def main():
-    global known_logins, known_channels, pub_socket, reference_socket
+    global known_logins, known_channels, pub_socket, reference_socket, sub_socket
     global client_messages_received, zmq_context
     known_logins = persistence.load_logins(LOGINS_PATH)
     known_channels = persistence.load_channels(CHANNELS_PATH)
@@ -417,8 +696,15 @@ def main():
     pub_socket.connect(BROKER_XSUB_ADDRESS)
     print(f"[SERVER] PUB conectado ao broker em {BROKER_XSUB_ADDRESS}")
 
+    # SUB no XPUB do broker (Parte 4): recebe o anuncio do coordenador no topico `servers`.
+    sub_socket = context.socket(zmq.SUB)
+    sub_socket.connect(BROKER_XPUB_ADDRESS)
+    sub_socket.setsockopt(zmq.SUBSCRIBE, SERVERS_TOPIC.encode("utf-8"))
+    print(f"[SERVER] SUB conectado ao broker em {BROKER_XPUB_ADDRESS}, "
+          f"assinando o topico '{SERVERS_TOPIC}'")
+
     reference_socket = new_reference_socket()
-    # O registro inicial NAO e mais fatal: se o Reference estiver fora do ar, o
+    # O registro inicial NAO e fatal: se o Reference estiver fora do ar, o
     # servidor sobe mesmo assim e tenta de novo (backoff) a partir do loop.
     if not try_register():
         print("[SERVER] iniciado SEM registro no Reference Service; "
@@ -426,14 +712,12 @@ def main():
 
     try:
         while True:
+            drain_announcements()
             try:
                 raw = socket.recv()
             except zmq.Again:
-                maybe_register()  # ocioso: aproveita para tentar o registro
+                housekeeping()  # ocioso: registro, eleicao, reanuncio e sincronizacao
                 continue
-            client_messages_received += 1
-            if client_messages_received % HEARTBEAT_EVERY == 0:
-                send_heartbeat()
 
             # Cada mensagem e tratada isoladamente: qualquer falha ao
             # decodificar o MessagePack, ou ao processar o envelope
@@ -442,10 +726,13 @@ def main():
             # vez de propagar e derrubar o servidor inteiro. O socket REP
             # exige exatamente 1 send() por recv(), entao SEMPRE
             # respondemos algo, mesmo em erro.
+            is_peer_message = False
             try:
                 envelope = msgpack.unpackb(raw, raw=False)
                 observe_message(envelope)
                 print(f"[RECV] {envelope}")
+                is_peer_message = (isinstance(envelope, dict)
+                                   and envelope.get("type") in PEER_TYPES)
                 response = dispatch(envelope)
                 out = msgpack.packb(response, use_bin_type=True)
             except Exception as e:
@@ -461,12 +748,18 @@ def main():
 
             socket.send(out)
             print(f"[SEND] {response}")
-            maybe_register()  # depois de responder: a tentativa nao atrasa o client
+
+            # Depois de responder: nada abaixo atrasa o cliente que acabou de ser atendido.
+            if not is_peer_message:
+                client_messages_received += 1
+                after_client_message()
+            housekeeping()
     except KeyboardInterrupt:
         print("\n[SERVER] Encerrando...")
     finally:
         socket.close()
         pub_socket.close()
+        sub_socket.close()
         reference_socket.close()
         context.term()
 

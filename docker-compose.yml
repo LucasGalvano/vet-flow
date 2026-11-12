@@ -1,5 +1,5 @@
-# Orquestracao das Partes 1, 2 e 3: 2 servidores, referência, broker REQ/REP,
-# broker Pub/Sub e bots que demonstram login, canais e publicacao/assinatura,
+# Orquestracao das Partes 1 a 4: 2 servidores (eleicao de coordenador e sincronizacao
+# de relogio entre eles), referência, broker REQ/REP, broker Pub/Sub e bots que demonstram login, canais e publicacao/assinatura,
 # incluindo interoperabilidade cruzada entre as duas linguagens -- tudo
 # automatico, sem interacao manual.
 #
@@ -32,6 +32,10 @@ services:
       REFERENCE_ADDRESS: tcp://reference-service:5559
       SERVER_NAME: python-server
       SERVER_BROKER_ADDRESS: tcp://reqrep-broker:5556
+      # Parte 4: SUB no XPUB do broker (topico `servers`) e desvio artificial do relogio
+      # local para demonstrar a sincronizacao (todos os containers compartilham o relogio).
+      BROKER_XPUB_ADDRESS: tcp://broker:5558
+      CLOCK_SKEW_MS: "-2000"
     ports:
       - "5555:5555"
     volumes:
@@ -51,6 +55,8 @@ services:
       REFERENCE_ADDRESS: tcp://reference-service:5559
       SERVER_NAME: java-server
       SERVER_BROKER_ADDRESS: tcp://reqrep-broker:5556
+      BROKER_XPUB_ADDRESS: tcp://broker:5558
+      CLOCK_SKEW_MS: "0"
     ports:
       - "5556:5555"
     volumes:

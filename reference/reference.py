@@ -1,4 +1,8 @@
-"""Reference Service da Parte 3. Atende somente servidores via REQ/REP."""
+"""Reference Service (Partes 3 e 4). Atende somente servidores via REQ/REP.
+
+Parte 4: a resposta NAO traz mais a hora (`reference_time_ms`); a sincronizacao
+de relogio agora e feita com o coordenador eleito entre os servidores. O servico
+continua informando rank, lista de servidores disponiveis e heartbeat."""
 
 import os
 import time
@@ -56,8 +60,6 @@ def main():
                         "status": "ERROR",
                         "error_msg": f"tipo desconhecido: {request_type}",
                     }
-                response_payload["reference_time_ms"] = int(time.time() * 1000)
-
                 logical_clock += 1
                 response = {
                     "type": "REFERENCE_RESPONSE",

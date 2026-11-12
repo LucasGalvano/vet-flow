@@ -1,13 +1,15 @@
 # vet_flow — Sistema Distribuído de Mensagens (Clínica Veterinária)
 
-> **Status do código:** Partes 1, 2 e 3 implementadas e validadas em Docker
-> (Python e Java, com interoperabilidade entre as linguagens).
+> **Status do código:** Partes 1 a 4 implementadas (Python e Java, com
+> interoperabilidade entre as linguagens).
 > Parte 1: login, criação e listagem de canais, com persistência em disco.
 > Parte 2: Pub/Sub via broker (`XSUB` 5557 / `XPUB` 5558), com persistência das
 > mensagens publicadas e bots padronizados (`ACTION=BOT_LOOP`).
 > Parte 3: relógios lógicos, serviço de referência (rank, lista de servidores e
 > heartbeat) e broker REQ/REP com round-robin entre os servidores.
-> A Parte 4 (eleição e Berkeley) ainda **não** está implementada.
+> Parte 4: eleição de coordenador (algoritmo do valentão) e sincronização do
+> relógio físico dos servidores com o coordenador.
+> A replicação de dados (Parte 5) ainda **não** está implementada.
 
 ## Objetivo
 
@@ -30,9 +32,6 @@ O projeto terá 5 partes: (1) login/canais/persistência, (2) Pub/Sub via
 broker, (3) relógios lógicos + heartbeat + Reference Service, (4) eleição
 de coordenador + algoritmo de Berkeley, (5) replicação entre réplicas.
 
-O contrato de mensagens comum entre Python e Java está documentado em
-[`protocol/PROTOCOL.md`](protocol/PROTOCOL.md) e é atualizado conforme cada
-parte é implementada.
 
 ## O que já está implementado (Parte 1 — completa)
 
@@ -57,8 +56,7 @@ parte é implementada.
 - Clients (Python e Java): `ACTION=PUBLISH` e `ACTION=SUBSCRIBE`
   (`SUB` direto no broker, escuta por `SUBSCRIBE_SECONDS` e sai).
 - Framing: multipart — frame 1 = tópico (nome do canal, UTF-8, mecanismo de
-  roteamento), frame 2 = envelope completo em MessagePack. Ver
-  [`protocol/PROTOCOL.md`](protocol/PROTOCOL.md).
+  roteamento), frame 2 = envelope completo em MessagePack.
 - Interoperabilidade Pub/Sub testada manualmente: Python→Python,
   Java→Java, servidor Python→subscriber Java e servidor Java→subscriber
   Python.
@@ -75,13 +73,84 @@ parte é implementada.
   servidores disponíveis (`REFERENCE_LIST_REQUEST`) e renova a disponibilidade a
   cada heartbeat (`REFERENCE_HEARTBEAT_REQUEST`).
 - **Heartbeat:** cada servidor o envia a cada 10 mensagens de clientes recebidas
-  (`HEARTBEAT_EVERY`). A resposta traz `reference_time_ms`, usado para ajustar o
-  deslocamento do relógio físico do servidor. Sem heartbeat por 30 s o servidor
-  sai da lista, mas mantém o rank ao voltar.
+  (`HEARTBEAT_EVERY`). Sem heartbeat por 30 s o servidor sai da lista, mas mantém
+  o rank ao voltar. (Na Parte 3 a resposta trazia a hora de referência; na Parte 4
+  ela deixou de trazer, ver abaixo.)
 - **Broker REQ/REP** (`broker-reqrep/`): `ROUTER` (5555, bots) e `DEALER` (5556,
   servidores), com round-robin entre os servidores. Ver "Brokers".
 - **Logs completos** de tudo que é enviado e recebido, inclusive as trocas
   servidor-Reference e a publicação no tópico.
+
+## O que já está implementado (Parte 4 — eleição e sincronização de relógio)
+
+**Coordenador.** Cada servidor guarda em `coordinator` o nome do servidor eleito.
+O coordenador é o servidor de **maior rank** disponível (algoritmo do valentão /
+*bully*, o padrão do diagrama do enunciado).
+
+**Eleição.** Ao iniciar (depois de receber o rank do Reference), ou quando o
+coordenador não responde, o servidor:
+1. consulta a lista de servidores no Reference (`REFERENCE_LIST_REQUEST`);
+2. envia `ELECTION_REQUEST` **só aos de rank maior** (`tcp://<nome>:5555`);
+3. se algum responde `OK`, espera o anúncio dele (`ELECTION_WAIT_SECONDS`, 5 s) e
+   refaz a eleição se ele não chegar; o servidor que respondeu `OK` assume a
+   eleição por conta própria;
+4. se nenhum responde, torna-se coordenador e publica o nome no tópico `servers`.
+
+Quando um servidor de rank maior volta, ele mesmo se elege ao iniciar e passa a
+ser o coordenador; os demais adotam o anúncio dele.
+
+**Anúncio.** `COORDINATOR_ANNOUNCEMENT` (`{coordinator, rank}`) publicado no tópico
+`servers` do broker Pub/Sub; todo servidor assina esse tópico no `XPUB` (5558).
+O coordenador **republica** o anúncio a cada 5 s (`COORDINATOR_ANNOUNCE_SECONDS`):
+o Pub/Sub do ZeroMQ não garante entrega a quem acabou de assinar (*slow joiner*)
+e isso também desfaz coordenadores divergentes (um anúncio de rank **menor** faz o
+servidor maior disputar a coordenação). O nome `servers` é reservado: não é
+possível criar um canal com ele.
+
+**Sincronização de relógio.** A cada 15 mensagens de clientes recebidas
+(`SYNC_EVERY`), e logo que passa a conhecer um novo coordenador, o servidor envia
+`CLOCK_REQUEST` ao coordenador e recebe `CLOCK_RESPONSE` com a hora dele
+(`time_ms`). O servidor ajusta o relógio compensando **metade do tempo de ida e
+volta** (estimativa de Cristian). Se o coordenador não responde (ou responde que
+não é mais o coordenador), é tratado como indisponível e uma nova eleição começa.
+O coordenador é a referência de tempo e não se ajusta.
+
+> Versão simplificada de Berkeley: conforme o diagrama do enunciado, o
+> coordenador apenas **informa a hora correta**; ele não coleta nem faz a média
+> dos relógios dos demais.
+
+**Reference Service.** O heartbeat não devolve mais a hora (`reference_time_ms`);
+continua dando rank, lista e heartbeat. A lista só tem nome e rank: o endereço de
+um servidor é `tcp://<nome>:5555` (o nome registrado é o hostname no Compose).
+
+**Desvio de relógio para demonstração.** No Docker todos os containers compartilham
+o mesmo relógio, então a sincronização não teria o que corrigir. `CLOCK_SKEW_MS`
+simula um relógio local errado: no `docker-compose.yml`, `python-server` tem
+`-2000` e `java-server` `0`. Para desligar, remova a variável.
+
+**Mensagens novas** (mesmo envelope: `type`, `sender_id`, `sender_lang`,
+`timestamp`, `logical_clock`, `payload`):
+
+| Tipo | Canal | Payload |
+|---|---|---|
+| `ELECTION_REQUEST` | REQ servidor→servidor (rank maior) | `{rank}` |
+| `ELECTION_RESPONSE` | REP | `{status: "OK", rank}` |
+| `CLOCK_REQUEST` | REQ servidor→coordenador | `{}` |
+| `CLOCK_RESPONSE` | REP | `{status: "OK", time_ms}` ou `{status: "ERROR", error_msg, coordinator}` |
+| `COORDINATOR_ANNOUNCEMENT` | PUB, tópico `servers` | `{coordinator, rank}` |
+
+**Detalhes de implementação.**
+- Tudo continua no loop único do `REP`, sem threads: o servidor atende os pares na
+  mesma porta 5555 (direto, sem passar pelo broker REQ/REP) e lê o tópico
+  `servers` sem bloquear a cada ciclo. O heartbeat e a sincronização agora rodam
+  **depois** de responder o cliente.
+- Um servidor só inicia trocas com servidores de rank **maior** (eleição) ou com
+  o coordenador (relógio), então as esperas formam uma cadeia e não um ciclo; o
+  pior caso é um atraso de até `PEER_TIMEOUT_MS` (1 s) por par que não responde.
+- Mensagens `ELECTION_REQUEST` e `CLOCK_REQUEST` não contam para o heartbeat nem
+  para a sincronização (só mensagens de clientes).
+- Logs novos: `[ELEICAO]`, `[COORDENADOR]`, `[CLOCK-SYNC]`, `[PEER-SEND]`/`[PEER-RECV]`
+  e `[PUB-SEND]`/`[PUBSUB-RECV]` do tópico `servers`.
 
 ## Estrutura de diretórios
 
@@ -101,8 +170,6 @@ projeto/
 │   ├── reference.py       # serviço de referência (Parte 3)
 │   ├── registry.py        # ranks e leases de heartbeat
 │   └── Dockerfile
-├── protocol/
-│   └── PROTOCOL.md        # contrato comum de mensagens Python <-> Java
 ├── tests/
 │   ├── test_publish_validation.py   # contrato do PUBLISH_REQUEST (qualquer servidor)
 │   ├── test_part3.py                # ranks e disponibilidade
@@ -167,6 +234,13 @@ obrigatória — todas têm valor padrão seguro no código.
 | `BOT_DELAY_SECONDS` | client | `1` | Pausa entre publicações de `ACTION=BOT_LOOP` |
 | `REFERENCE_ADDRESS` | server | `tcp://localhost:5559` | Endereço do serviço de referência |
 | `SERVER_BROKER_ADDRESS` | server | _(vazio)_ | Backend do broker REQ/REP (ex.: `tcp://reqrep-broker:5556`). Se vazio, o servidor só faz `bind` |
+| `BROKER_XPUB_ADDRESS` | server | `tcp://localhost:5558` | XPUB do broker Pub/Sub, onde o servidor assina o tópico `servers` (Parte 4) |
+| `SYNC_EVERY` | server | `15` | Mensagens de clientes entre sincronizações de relógio com o coordenador |
+| `PEER_PORT` | server | `5555` | Porta dos pares (endereço do par: `tcp://<nome>:PEER_PORT`) |
+| `PEER_TIMEOUT_MS` | server | `1000` | Timeout das trocas entre servidores (eleição e relógio) |
+| `ELECTION_WAIT_SECONDS` | server | `5` | Espera pelo anúncio depois de um servidor maior responder OK |
+| `COORDINATOR_ANNOUNCE_SECONDS` | server | `5` | Intervalo da republicação do anúncio pelo coordenador |
+| `CLOCK_SKEW_MS` | server | `0` | Desvio artificial do relógio local (demonstração da sincronização) |
 | `SERVER_NAME` | server | nome da implementação | Nome único usado no registro e heartbeat |
 | `HEARTBEAT_EVERY` | server | `10` | Mensagens de clientes entre heartbeats |
 | `REFERENCE_TIMEOUT_MS` | server | `1000` | Quanto o servidor espera a resposta do Reference Service em cada troca (registro/heartbeat). **Não confundir** com `REFERENCE_TIMEOUT_SECONDS`, que é do lado do Reference |
@@ -293,11 +367,7 @@ novamente. Esse limite pode ser alterado com `REFERENCE_TIMEOUT_SECONDS`.
 enquanto ele está no ar, mas se o Reference reiniciar a numeração recomeça pelo
 primeiro servidor que se registrar. Isso é aceitável nesta parte do projeto.
 
-**Precisão do ajuste de relógio.** O deslocamento é `hora_de_referência − hora_local`
-no instante da resposta e **não compensa a latência** da troca. Como no Docker
-todos os containers compartilham o mesmo relógio, o deslocamento real é ~0 ms e o
-valor observado nos logs (de −1 a −300 ms) é só latência e atraso da JVM. A
-sincronização muda na Parte 4 (coordenador eleito, algoritmo de Berkeley).
+**Relógio dos servidores.** Na Parte 3 o servidor ajustava o relógio pela hora devolvida no heartbeat do Reference (sem compensar a latência). Na Parte 4 isso foi substituído pela sincronização com o coordenador eleito (ver acima).
 
 **Resiliência frente a um Reference indisponível.** O servidor não fica preso a
 ele: a troca com o Reference tem timeout curto (`REFERENCE_TIMEOUT_MS`, padrão
@@ -335,7 +405,7 @@ timestamp de envio e timestamp local de recebimento.
 ## Escolhas de projeto
 
 - **Linguagens:** Python e Java. Cada uma tem cliente (bot) e servidor completos,
-  e todos falam o mesmo protocolo (ver `protocol/PROTOCOL.md`). O projeto é
+  e todos falam o mesmo protocolo. O projeto é
   individual, então as duas linguagens atendem ao requisito mínimo.
 - **Troca de mensagens:** ZeroMQ. REQ/REP entre bots e servidores (passando pelo
   broker REQ/REP) e entre servidores e Reference Service; PUB/SUB para a
@@ -405,7 +475,7 @@ Executada em Docker Desktop (Windows), com build limpo e sem dados residuais:
 |---|---|---|
 | Subida e bots de um passo | `docker compose ps -a` | Todos os bots de login/canal/Pub-Sub terminaram com `Exited (0)`; bots de loop ativos |
 | Round-robin e interoperabilidade | `docker compose logs <servidor> \| Select-String "bot-<outra-linguagem>-loop"` | Cada servidor recebeu requisições dos bots de loop das **duas** linguagens |
-| Heartbeat | logs do `reference-service` | Cada servidor envia heartbeat a cada ~10 mensagens, com `rank` e `reference_time_ms` |
+| Heartbeat | logs do `reference-service` | Cada servidor envia heartbeat a cada ~10 mensagens, com `rank` e `reference_time_ms` (a hora deixou de ser devolvida na Parte 4) |
 | Rank estável | `docker compose restart java-server` | O servidor volta com o mesmo rank |
 | Expiração e retorno | `python tests\list_servers.py` antes/depois de `stop` + 35 s + `start` | Lista com os 2 servidores → só o Python → os 2 de volta, Java com rank 2 |
 | Relógio lógico | logs de bots e servidores | Valores crescem de forma coerente (envio incrementa, recebimento usa o máximo) |
@@ -455,15 +525,43 @@ lentas, aumente esse valor.
   (`publicação recusada: canal ... nao existe`). Esperado; a replicação da
   Parte 5 resolve.
 - **Prefix match no Pub/Sub:** assinar `vac` também recebe `vacinas`.
-- **Ajuste de relógio sem compensação de latência** (ver Parte 3); substituído na Parte 4.
+- **Servidores ociosos saem da lista do Reference:** o heartbeat só sai a cada 10
+  mensagens de clientes. Sem tráfego por 30 s o servidor some da lista, e um
+  servidor que inicia uma eleição nessa janela não o vê. Isso se corrige sozinho:
+  o coordenador republica o anúncio a cada 5 s e um anúncio de rank maior sempre
+  prevalece. Durante a janela pode haver dois coordenadores por alguns segundos.
+- **Detecção de falha do coordenador só na sincronização:** a queda é percebida na
+  próxima sincronização (a cada 15 mensagens) ou na próxima eleição, não por
+  monitoramento contínuo.
 - **Ranks em memória** no Reference.
 - **Servidor parado:** uma requisição que o broker entregar a um servidor caído
   expira no bot (`RECV_TIMEOUT_MS`) e o bot de loop pode encerrar. Tratar isso
   entra junto com a tolerância a falhas das próximas partes.
 
+## Validação da Parte 4
+
+A lógica de eleição e sincronização foi exercitada com servidores Python locais
+(subida em ordem, queda e volta do coordenador, resposta `OK` de servidor maior).
+Para validar em Docker:
+
+```powershell
+docker compose down
+Remove-Item -Force .\python\server\data\*.msgpack, .\java\server\data\*.msgpack -ErrorAction SilentlyContinue
+docker compose up --build -d
+Start-Sleep 30
+docker compose logs python-server java-server | Select-String "ELEICAO|COORDENADOR|CLOCK-SYNC"
+```
+
+| Verificação | Esperado |
+|---|---|
+| Eleição inicial | `java-server` (rank 2) vira coordenador; `python-server` registra `novo coordenador: java-server` |
+| Sincronização | `python-server` mostra `[CLOCK-SYNC] ... correcao=+2000ms` (desfaz o desvio) e depois correções de poucos ms |
+| Anúncio | `[PUBSUB-RECV] topic=servers` nos dois servidores, a cada ~5 s |
+| Queda do coordenador | `docker compose stop java-server` → no próximo `CLOCK-SYNC` o `python-server` mostra `indisponivel` e `eleito coordenador` |
+| Volta do coordenador | `docker compose start java-server` → `java-server` se elege de novo e o `python-server` adota o anúncio |
+| Heartbeat sem hora | `docker compose logs reference-service \| Select-String "reference_time_ms"` não retorna nada |
+
 ## Próximos passos
 
-Parte 4: eleição de coordenador (valentão/*bully*, com `REQ: eleição` entre
-servidores e anúncio no tópico `servers`), sincronização de relógio a cada 15
-mensagens com o coordenador (Berkeley simplificado) e remoção da hora do
-heartbeat no Reference. Parte 5: replicação dos dados entre todos os servidores.
+Parte 5: replicação dos dados (logins, canais e mensagens) entre todos os
+servidores, para que cada um tenha o histórico completo.
