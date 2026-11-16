@@ -12,6 +12,7 @@ Ver contrato completo em protocol/PROTOCOL.md.
 """
 
 import os
+import random
 import time
 
 import msgpack
@@ -62,7 +63,18 @@ ANNOUNCE_EVERY_SECONDS = float(os.environ.get("COORDINATOR_ANNOUNCE_SECONDS", "5
 # containers compartilham o mesmo relogio fisico).
 CLOCK_SKEW_MS = int(os.environ.get("CLOCK_SKEW_MS", "0"))
 SERVERS_TOPIC = "servers"
-PEER_TYPES = ("ELECTION_REQUEST", "CLOCK_REQUEST")
+PEER_TYPES = ("ELECTION_REQUEST", "CLOCK_REQUEST", "SYNC_REQUEST")
+
+# --- Parte 5: replicacao dos dados entre todos os servidores ---
+# Topico Pub/Sub em que cada servidor publica os registros que grava (todos assinam).
+REPLICATION_TOPIC = "replication"
+# Intervalo (com variacao aleatoria de +-30%) da anti-entropia periodica com um par.
+REPL_SYNC_SECONDS = float(os.environ.get("REPL_SYNC_SECONDS", "10"))
+# Maximo de registros por SYNC_RESPONSE e de lotes por sincronizacao.
+REPL_BATCH = max(1, int(os.environ.get("REPL_BATCH", "500")))
+REPL_MAX_BATCHES = 20
+RESERVED_CHANNELS = (SERVERS_TOPIC, REPLICATION_TOPIC)
+KINDS = ("login", "channel", "message")
 # Resiliencia frente a um Reference Service indisponivel (ver CONTEXTO.md, D24):
 #  - timeout de cada troca com o Reference (antes fixo em 5000 ms);
 #  - tentativas explicitas de registro, com intervalo inicial e backoff
@@ -97,6 +109,9 @@ announce_due = False
 next_announcement_at = 0.0
 sync_due = False
 sub_socket = None
+rep_socket = None  # REP principal (tambem usado para atender pares enquanto se espera resposta)
+next_heartbeat_at = HEARTBEAT_EVERY
+next_sync_count = SYNC_EVERY
 client_messages_received = 0
 server_rank = None
 zmq_context = None
@@ -169,13 +184,37 @@ def reset_reference_socket() -> None:
     reference_socket = new_reference_socket()
 
 
+def recv_while_serving(sock, timeout_ms: int) -> bytes:
+    """Espera a resposta de um socket REQ SEM deixar de atender o REP principal.
+
+    Dois servidores que se pedem algo ao mesmo tempo (ex.: anti-entropia ou relogio) ficariam
+    cada um bloqueado esperando o outro ate o timeout. Enquanto espera, o servidor atende as
+    requisicoes que chegam no REP (so responde; heartbeat e demais tarefas ficam para o loop
+    principal). E seguro porque todo pedido a pares/Reference parte de um ponto em que o REP ja
+    respondeu a ultima requisicao."""
+    poller = zmq.Poller()
+    poller.register(sock, zmq.POLLIN)
+    if rep_socket is not None:
+        poller.register(rep_socket, zmq.POLLIN)
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while True:
+        remaining = int((deadline - time.monotonic()) * 1000)
+        if remaining <= 0:
+            raise zmq.Again()
+        events = dict(poller.poll(remaining))
+        if sock in events:
+            return sock.recv()
+        if rep_socket is not None and rep_socket in events:
+            process_raw(rep_socket.recv())
+
+
 def reference_request(msg_type: str, payload: dict) -> dict:
     """Troca uma mensagem MessagePack com o Reference Service."""
     request = build_envelope(msg_type, payload)
     print(f"[REF-SEND] {request}")
     try:
         reference_socket.send(msgpack.packb(request, use_bin_type=True))
-        raw_response = reference_socket.recv()
+        raw_response = recv_while_serving(reference_socket, REFERENCE_TIMEOUT_MS)
     except zmq.ZMQError:
         reset_reference_socket()
         raise
@@ -247,7 +286,7 @@ def send_heartbeat() -> None:
 #  - O anuncio do coordenador chega pelo topico `servers` (socket SUB no broker Pub/Sub).
 # ---------------------------------------------------------------------------
 
-def peer_request(name: str, msg_type: str, payload: dict) -> dict:
+def peer_request(name: str, msg_type: str, payload: dict, verbose: bool = True) -> dict:
     """REQ/REP direto com outro servidor. Socket descartavel por troca: um REQ que
     estoura o timeout fica inutilizavel (mesma razao do Reference)."""
     sock = zmq_context.socket(zmq.REQ)
@@ -257,13 +296,15 @@ def peer_request(name: str, msg_type: str, payload: dict) -> dict:
     try:
         sock.connect(f"tcp://{name}:{PEER_PORT}")
         request = build_envelope(msg_type, payload)
-        print(f"[PEER-SEND] para={name} {request}")
+        if verbose:
+            print(f"[PEER-SEND] para={name} {request}")
         sock.send(msgpack.packb(request, use_bin_type=True))
-        response = msgpack.unpackb(sock.recv(), raw=False)
+        response = msgpack.unpackb(recv_while_serving(sock, PEER_TIMEOUT_MS), raw=False)
     finally:
         sock.close()
     observe_message(response)
-    print(f"[PEER-RECV] de={name} {response}")
+    if verbose:
+        print(f"[PEER-RECV] de={name} {response}")
     return response
 
 
@@ -366,17 +407,20 @@ def drain_announcements() -> None:
         try:
             topic, body = sub_socket.recv_multipart(flags=zmq.NOBLOCK)
         except zmq.Again:
+            flush_dirty()  # grava de uma vez os registros replicados recebidos neste ciclo
             return
         try:
             envelope = msgpack.unpackb(body, raw=False)
             observe_message(envelope)
             topic_name = topic.decode("utf-8")
-            print(f"[PUBSUB-RECV] topic={topic_name} {envelope}")
             # O ZeroMQ casa topicos por prefixo: confere o nome inteiro.
             if topic_name == SERVERS_TOPIC and envelope.get("type") == "COORDINATOR_ANNOUNCEMENT":
+                print(f"[PUBSUB-RECV] topic={topic_name} {envelope}")
                 handle_coordinator_announcement(envelope)
+            elif topic_name == REPLICATION_TOPIC and envelope.get("type") == "REPLICATION":
+                handle_replication(envelope)
         except Exception as exc:
-            print(f"[ERROR] Falha ao processar mensagem do topico servers: {exc}")
+            print(f"[ERROR] Falha ao processar mensagem dos topicos de servidores: {exc}")
 
 
 def sync_clock() -> None:
@@ -462,15 +506,322 @@ def housekeeping() -> None:
         sync_clock()
         if election_due and time.monotonic() >= election_not_before:
             run_election()  # o coordenador caiu durante a sincronizacao
+    replication_housekeeping()
 
 
 def after_client_message() -> None:
-    """Chamado depois de responder uma mensagem de cliente (nao atrasa a resposta)."""
-    global sync_due
-    if client_messages_received % HEARTBEAT_EVERY == 0:
+    """Chamado depois de responder uma mensagem de cliente (nao atrasa a resposta).
+    Usa a contagem acumulada: mensagens atendidas durante uma espera tambem contam."""
+    global sync_due, next_heartbeat_at, next_sync_count
+    if client_messages_received >= next_heartbeat_at:
+        next_heartbeat_at = (client_messages_received // HEARTBEAT_EVERY + 1) * HEARTBEAT_EVERY
         send_heartbeat()
-    if client_messages_received % SYNC_EVERY == 0:
+    if client_messages_received >= next_sync_count:
+        next_sync_count = (client_messages_received // SYNC_EVERY + 1) * SYNC_EVERY
         sync_due = True
+
+
+# ---------------------------------------------------------------------------
+# Parte 5: replicacao ativa com anti-entropia
+#
+# Todo servidor guarda TODOS os registros (logins, canais e mensagens). Cada registro
+# recebe um id (origin, seq): `origin` e o servidor que o gravou e `seq` um contador por
+# origem (compartilhado pelos tres tipos). Logo apos gravar, o servidor publica o
+# registro no topico `replication`; os demais o aplicam de forma idempotente (um id ja
+# visto e ignorado). O Pub/Sub nao garante entrega, entao ha anti-entropia: cada servidor
+# conhece, por origem, o maior seq sem buracos (`repl_contiguous`) e pede aos pares
+# (SYNC_REQUEST) o que falta -- ao iniciar, ao detectar um buraco e periodicamente.
+# ---------------------------------------------------------------------------
+
+known_messages = []
+channel_winners = {}     # nome do canal -> registro vencedor (criacoes concorrentes)
+repl_seen = {}           # origem -> conjunto de seq ja aplicados
+repl_contiguous = {}     # origem -> maior n tal que 1..n foram aplicados
+next_seq = 1             # proximo seq deste servidor
+dirty_kinds = set()      # tipos com registros replicados ainda nao gravados em disco
+repl_gap_peers = set()   # origens com buraco detectado (sincronizar com elas)
+repl_initial_sync_done = False
+repl_next_attempt = 0.0
+next_repl_sync_at = 0.0
+repl_peer_cursor = 0
+
+
+def kind_list(kind: str) -> list:
+    return {"login": known_logins, "channel": known_channels, "message": known_messages}[kind]
+
+
+def kind_path(kind: str) -> str:
+    return {"login": LOGINS_PATH, "channel": CHANNELS_PATH, "message": MESSAGES_PATH}[kind]
+
+
+def save_kind(kind: str) -> None:
+    {"login": persistence.save_logins,
+     "channel": persistence.save_channels,
+     "message": persistence.save_messages}[kind](kind_list(kind), kind_path(kind))
+
+
+def flush_dirty() -> None:
+    global dirty_kinds
+    for kind in sorted(dirty_kinds):
+        save_kind(kind)
+    dirty_kinds = set()
+
+
+def record_key(record: dict) -> tuple:
+    """Ordem total e igual em todos os servidores: relogio logico, origem e seq."""
+    lc = record.get("lc")
+    return (lc if isinstance(lc, int) and not isinstance(lc, bool) else 0,
+            str(record.get("origin")), record.get("seq") or 0)
+
+
+def mark_seen(origin: str, seq: int) -> None:
+    global next_seq
+    seen = repl_seen.setdefault(origin, set())
+    seen.add(seq)
+    n = repl_contiguous.get(origin, 0)
+    while (n + 1) in seen:
+        n += 1
+    repl_contiguous[origin] = n
+    if origin == SERVER_NAME and seq >= next_seq:
+        next_seq = seq + 1
+
+
+def valid_record(kind, record) -> bool:
+    return (kind in KINDS and isinstance(record, dict)
+            and isinstance(record.get("origin"), str) and record["origin"] != ""
+            and isinstance(record.get("seq"), int) and not isinstance(record["seq"], bool)
+            and record["seq"] > 0)
+
+
+def apply_record(kind: str, record: dict) -> bool:
+    """Aplica um registro (local ou replicado). Idempotente: retorna False se o id ja foi visto."""
+    origin, seq = record["origin"], record["seq"]
+    if seq in repl_seen.get(origin, ()):
+        return False
+    mark_seen(origin, seq)
+    kind_list(kind).append(record)
+    if kind == "channel":
+        name = record.get("channel_name")
+        current = channel_winners.get(name)
+        # Criacoes concorrentes do mesmo canal em servidores diferentes: vence a de menor
+        # (relogio logico, origem, seq) -- o mesmo criterio em todos os servidores.
+        if current is None or record_key(record) < record_key(current):
+            channel_winners[name] = record
+    return True
+
+
+def load_state() -> None:
+    """Carrega os dados do disco e reconstroi os indices de replicacao."""
+    global known_logins, known_channels, known_messages
+    known_logins = persistence.load_logins(LOGINS_PATH)
+    known_channels = persistence.load_channels(CHANNELS_PATH)
+    known_messages = persistence.load_messages(MESSAGES_PATH)
+    legacy = []
+    for kind in KINDS:
+        for record in kind_list(kind):
+            if valid_record(kind, record):
+                mark_seen(record["origin"], record["seq"])
+            else:
+                legacy.append((kind, record))
+    # Registros gravados antes da Parte 5 (sem id): migra como se fossem deste servidor.
+    migrated = set()
+    for kind, record in legacy:
+        record["origin"] = SERVER_NAME
+        record["seq"] = next_seq
+        record.setdefault("lc", 0)
+        mark_seen(SERVER_NAME, record["seq"])
+        migrated.add(kind)
+    for kind in KINDS:
+        if kind == "channel":
+            for record in kind_list("channel"):
+                name = record.get("channel_name")
+                current = channel_winners.get(name)
+                if current is None or record_key(record) < record_key(current):
+                    channel_winners[name] = record
+    for kind in migrated:
+        save_kind(kind)
+    if legacy:
+        print(f"[REPLICA] {len(legacy)} registro(s) antigo(s) migrado(s) para o formato com id")
+
+
+def replicate(kind: str, record: dict) -> None:
+    envelope = build_envelope("REPLICATION", {"kind": kind, "record": record})
+    print(f"[REPLICA-SEND] topic={REPLICATION_TOPIC} {envelope}")
+    try:
+        pub_socket.send_multipart([
+            REPLICATION_TOPIC.encode("utf-8"),
+            msgpack.packb(envelope, use_bin_type=True),
+        ])
+    except Exception as exc:
+        # O registro ja esta em disco: a anti-entropia entrega aos demais depois.
+        print(f"[ERROR] Falha ao replicar: {exc}")
+
+
+def local_store(kind: str, record: dict) -> None:
+    """Grava um registro originado neste servidor: id, disco e so entao replicacao."""
+    record["origin"] = SERVER_NAME
+    record["seq"] = next_seq
+    record["lc"] = logical_clock
+    apply_record(kind, record)
+    save_kind(kind)
+    replicate(kind, record)
+
+
+def handle_replication(envelope: dict) -> None:
+    payload = envelope.get("payload") or {}
+    kind, record = payload.get("kind"), payload.get("record")
+    if not valid_record(kind, record):
+        print(f"[ERROR] REPLICATION invalida ignorada: {envelope}")
+        return
+    if record["origin"] == SERVER_NAME:
+        return  # eco do que este servidor mesmo publicou
+    applied = apply_record(kind, record)
+    print(f"[REPLICA-RECV] {'aplicado' if applied else 'duplicado'} {envelope}")
+    if applied:
+        dirty_kinds.add(kind)
+        if record["seq"] > repl_contiguous.get(record["origin"], 0):
+            repl_gap_peers.add(record["origin"])  # chegou fora de ordem: ha buraco
+
+
+def apply_batch(items) -> int:
+    """Aplica um lote do SYNC_RESPONSE (inclui, se for o caso, registros deste proprio
+    servidor que ele havia perdido)."""
+    applied = 0
+    for item in items or []:
+        kind = (item or {}).get("kind")
+        record = (item or {}).get("record")
+        if valid_record(kind, record) and apply_record(kind, record):
+            dirty_kinds.add(kind)
+            applied += 1
+    return applied
+
+
+def handle_sync_request(envelope: dict) -> dict:
+    """SYNC_REQUEST de um par: devolve os registros acima do que ele ja tem (`have`)."""
+    payload = envelope.get("payload") or {}
+    have = payload.get("have") if isinstance(payload.get("have"), dict) else {}
+    limit = payload.get("limit")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        limit = REPL_BATCH
+    limit = min(limit, REPL_BATCH)
+    missing = []
+    for kind in KINDS:
+        for record in kind_list(kind):
+            known = have.get(record["origin"])
+            if record["seq"] > (known if isinstance(known, int) else 0):
+                missing.append((record["seq"], record["origin"], kind, record))
+    missing.sort(key=lambda m: (m[0], m[1]))  # por seq: cada origem sai em ordem crescente
+    batch = missing[:limit]
+    print(f"[SYNC] pedido de {envelope.get('sender_id')}: {len(missing)} registro(s) acima do "
+          f"que ele tem; enviando {len(batch)}")
+    return build_envelope("SYNC_RESPONSE", {
+        "status": "OK",
+        "records": [{"kind": m[2], "record": m[3]} for m in batch],
+        "more": len(missing) > len(batch),
+    })
+
+
+def sync_with_peer(name: str) -> int:
+    """Anti-entropia: puxa de um par os registros que faltam. Retorna quantos foram aplicados."""
+    total = 0
+    for _ in range(REPL_MAX_BATCHES):
+        have = dict(repl_contiguous)
+        print(f"[PEER-SEND] para={name} SYNC_REQUEST have={have} limit={REPL_BATCH}")
+        response = peer_request(name, "SYNC_REQUEST", {"have": have, "limit": REPL_BATCH},
+                                verbose=False)
+        payload = response.get("payload") or {}
+        if payload.get("status") != "OK":
+            raise RuntimeError(payload.get("error_msg") or "resposta invalida")
+        records = payload.get("records") or []
+        applied = apply_batch(records)
+        total += applied
+        print(f"[PEER-RECV] de={name} SYNC_RESPONSE registros={len(records)} novos={applied} "
+              f"mais={bool(payload.get('more'))}")
+        if not payload.get("more") or applied == 0:
+            break
+    flush_dirty()
+    return total
+
+
+def pull_from(name: str) -> None:
+    try:
+        total = sync_with_peer(name)
+        print(f"[SYNC] sincronizado com {name}: {total} registro(s) novo(s)")
+    except Exception as exc:
+        print(f"[SYNC] nao foi possivel sincronizar com {name} ({exc})")
+
+
+def schedule_next_sync() -> None:
+    global next_repl_sync_at
+    next_repl_sync_at = time.monotonic() + REPL_SYNC_SECONDS * random.uniform(0.7, 1.3)
+
+
+def replication_housekeeping() -> None:
+    """Anti-entropia: na partida, ao detectar buraco e periodicamente (com variacao
+    aleatoria, para dois servidores nao se pedirem dados ao mesmo tempo)."""
+    global repl_initial_sync_done, repl_next_attempt, repl_peer_cursor
+    if not reference_registered:
+        return
+    now = time.monotonic()
+    if now < repl_next_attempt:
+        return
+    if not repl_initial_sync_done:
+        try:
+            peers = other_servers()
+        except Exception as exc:
+            print(f"[SYNC] nao foi possivel listar os servidores no Reference: {exc}")
+            repl_next_attempt = now + 1.0
+            return
+        for peer in peers:
+            pull_from(peer["name"])
+        repl_initial_sync_done = True
+        schedule_next_sync()
+        return
+    if repl_gap_peers:
+        for name in list(repl_gap_peers):
+            repl_gap_peers.discard(name)
+            pull_from(name)
+    if now >= next_repl_sync_at:
+        schedule_next_sync()
+        try:
+            peers = other_servers()
+        except Exception:
+            return
+        if peers:
+            peer = peers[repl_peer_cursor % len(peers)]
+            repl_peer_cursor += 1
+            pull_from(peer["name"])
+
+
+def handle_history_request(envelope: dict) -> dict:
+    """HISTORY_REQUEST: ultimas mensagens de um canal, em ordem (relogio logico, origem, seq)."""
+    payload = envelope.get("payload") or {}
+    error = validate_required_string(payload, "channel_name")
+    if error:
+        return build_envelope("HISTORY_RESPONSE", {"status": "ERROR", "error_msg": error})
+    channel_name = payload["channel_name"]
+    if channel_name not in channel_winners:
+        return build_envelope(
+            "HISTORY_RESPONSE",
+            {"status": "ERROR", "error_msg": f"canal '{channel_name}' nao existe"},
+        )
+    limit = payload.get("limit")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        limit = 50
+    limit = min(limit, 500)
+    messages = sorted((r for r in known_messages if r.get("channel_name") == channel_name),
+                      key=record_key)
+    selected = messages[-limit:]
+    return build_envelope("HISTORY_RESPONSE", {
+        "status": "OK",
+        "channel_name": channel_name,
+        "total": len(messages),
+        "messages": [
+            {key: r.get(key) for key in
+             ("origin", "seq", "sender_id", "sender_lang", "message", "timestamp")}
+            for r in selected
+        ],
+    })
 
 
 def handle_login_request(envelope: dict) -> dict:
@@ -488,9 +839,7 @@ def handle_login_request(envelope: dict) -> dict:
         "sender_lang": envelope.get("sender_lang"),
         "timestamp": envelope.get("timestamp"),
     }
-
-    global known_logins
-    known_logins = persistence.append_login(record, LOGINS_PATH)
+    local_store("login", record)
 
     print(
         f"[LOGIN] bot='{bot_name}' lang={envelope.get('sender_lang')} "
@@ -519,20 +868,16 @@ def handle_channel_create_request(envelope: dict) -> dict:
             {"status": "ERROR", "error_msg": "campo 'bot_name' ausente ou vazio"},
         )
 
-    # `servers` e o topico do anuncio do coordenador (Parte 4): nao pode virar canal.
-    if channel_name == SERVERS_TOPIC:
+    # `servers` (Parte 4) e `replication` (Parte 5) sao topicos internos dos servidores.
+    if channel_name in RESERVED_CHANNELS:
         return build_envelope(
             "CHANNEL_CREATE_RESPONSE",
-            {"status": "ERROR", "error_msg": f"nome de canal reservado: '{SERVERS_TOPIC}'"},
+            {"status": "ERROR", "error_msg": f"nome de canal reservado: '{channel_name}'"},
         )
 
-    # Nome duplicado e tratado como erro (comparacao exata, case-sensitive).
-    # [DECISAO DE IMPLEMENTACAO] -- o enunciado nao especifica esse caso.
-    global known_channels
-    already_exists = any(
-        c.get("channel_name") == channel_name for c in known_channels
-    )
-    if already_exists:
+    # Nome duplicado e tratado como erro (comparacao exata, case-sensitive). Agora vale
+    # para o canal em QUALQUER servidor, ja que todos replicam todos os canais.
+    if channel_name in channel_winners:
         return build_envelope(
             "CHANNEL_CREATE_RESPONSE",
             {"status": "ERROR", "error_msg": f"canal '{channel_name}' ja existe"},
@@ -543,11 +888,11 @@ def handle_channel_create_request(envelope: dict) -> dict:
         "created_by": bot_name,
         "timestamp": envelope.get("timestamp"),
     }
-    known_channels = persistence.append_channel(record, CHANNELS_PATH)
+    local_store("channel", record)
 
     print(
         f"[CHANNEL_CREATE] channel='{channel_name}' created_by='{bot_name}' "
-        f"(total de canais: {len(known_channels)})"
+        f"(total de canais: {len(channel_winners)})"
     )
 
     return build_envelope("CHANNEL_CREATE_RESPONSE", {"status": "OK"})
@@ -555,8 +900,10 @@ def handle_channel_create_request(envelope: dict) -> dict:
 
 def handle_channel_list_request(envelope: dict) -> dict:
     """Trata CHANNEL_LIST_REQUEST e devolve CHANNEL_LIST_RESPONSE."""
-    channel_names = [c.get("channel_name") for c in known_channels]
-    return build_envelope("CHANNEL_LIST_RESPONSE", {"channels": channel_names})
+    winners = sorted(channel_winners.values(), key=record_key)
+    return build_envelope(
+        "CHANNEL_LIST_RESPONSE", {"channels": [c.get("channel_name") for c in winners]}
+    )
 
 
 def validate_required_string(payload: dict, field: str):
@@ -580,12 +927,11 @@ def validate_required_string(payload: dict, field: str):
 
 
 def handle_publish_request(envelope: dict) -> dict:
-    """Trata PUBLISH_REQUEST: valida canal, persiste e so entao publica
-    no broker (ver ordem persistencia->publicacao documentada em
-    protocol/PROTOCOL.md). Devolve PUBLISH_RESPONSE via REQ/REP.
+    """Trata PUBLISH_REQUEST: valida canal, persiste (e replica) e so entao publica
+    no broker. Devolve PUBLISH_RESPONSE via REQ/REP.
 
     Nenhuma requisicao invalida chega a persistencia nem ao broker: toda
-    validacao acontece antes do primeiro append_message."""
+    validacao acontece antes da gravacao."""
     payload = envelope.get("payload") or {}
 
     for field in ("channel_name", "message"):
@@ -598,8 +944,7 @@ def handle_publish_request(envelope: dict) -> dict:
     channel_name = payload["channel_name"]
     message = payload["message"]
 
-    channel_exists = any(c.get("channel_name") == channel_name for c in known_channels)
-    if not channel_exists:
+    if channel_name not in channel_winners:
         return build_envelope(
             "PUBLISH_RESPONSE",
             {"status": "ERROR", "error_msg": f"canal '{channel_name}' nao existe"},
@@ -612,10 +957,11 @@ def handle_publish_request(envelope: dict) -> dict:
         "message": message,
         "timestamp": envelope.get("timestamp"),
     }
-    # 1) Persiste primeiro (durabilidade antes de visibilidade).
-    persistence.append_message(record, MESSAGES_PATH)
+    # 1) Grava em disco e replica para os demais servidores (durabilidade antes de
+    #    visibilidade).
+    local_store("message", record)
 
-    # 2) So entao publica no broker, para subscribers ao vivo.
+    # 2) So entao publica no canal, para os subscribers ao vivo.
     publish_envelope = build_envelope(
         "CHANNEL_MESSAGE", {"channel_name": channel_name, "message": message}
     )
@@ -626,10 +972,9 @@ def handle_publish_request(envelope: dict) -> dict:
         try:
             pub_socket.send_multipart([topic, body])
         except Exception as e:
-            # A mensagem JA esta persistida (passo 1), entao nao perdemos
-            # dado -- so o subscriber ao vivo que nao recebe. Devolver erro
-            # ao client aqui faria um retry gerar mensagem duplicada em
-            # disco. Mesmo comportamento do Server.java.
+            # A mensagem JA esta persistida e replicada, entao nao perdemos dado -- so o
+            # subscriber ao vivo que nao recebe. Devolver erro ao client aqui faria um
+            # retry gerar mensagem duplicada. Mesmo comportamento do Server.java.
             print(f"[ERROR] Falha ao publicar no broker: {e}")
 
     print(f"[PUBLISH] channel='{channel_name}' message='{message}'")
@@ -653,12 +998,19 @@ def dispatch(envelope: dict) -> dict:
     if msg_type == "PUBLISH_REQUEST":
         return handle_publish_request(envelope)
 
+    if msg_type == "HISTORY_REQUEST":
+        return handle_history_request(envelope)
+
     # Parte 4: trocas entre servidores.
     if msg_type == "ELECTION_REQUEST":
         return handle_election_request(envelope)
 
     if msg_type == "CLOCK_REQUEST":
         return handle_clock_request(envelope)
+
+    # Parte 5: anti-entropia entre servidores.
+    if msg_type == "SYNC_REQUEST":
+        return handle_sync_request(envelope)
 
     # Tipo desconhecido nao deve derrubar o servidor (REP exige sempre 1
     # send() por recv(), senao o socket trava em estado inconsistente).
@@ -668,15 +1020,48 @@ def dispatch(envelope: dict) -> dict:
     )
 
 
+def process_raw(raw: bytes) -> bool:
+    """Decodifica, atende e RESPONDE uma requisicao do REP principal. Retorna True se era
+    uma troca entre servidores (nao conta como mensagem de cliente)."""
+    global client_messages_received
+    # Cada mensagem e tratada isoladamente: qualquer falha ao decodificar o MessagePack, ou
+    # ao processar o envelope (campos ausentes, tipos inesperados, envelope que nao e um
+    # dict, etc.), e capturada aqui e vira um ERROR_RESPONSE, em vez de derrubar o servidor.
+    # O socket REP exige exatamente 1 send() por recv(), entao SEMPRE respondemos algo.
+    is_peer_message = False
+    try:
+        envelope = msgpack.unpackb(raw, raw=False)
+        observe_message(envelope)
+        print(f"[RECV] {envelope}")
+        is_peer_message = (isinstance(envelope, dict)
+                           and envelope.get("type") in PEER_TYPES)
+        response = dispatch(envelope)
+        out = msgpack.packb(response, use_bin_type=True)
+    except Exception as e:
+        print(f"[ERROR] Falha ao processar mensagem: {e}")
+        response = build_envelope(
+            "ERROR_RESPONSE",
+            {
+                "status": "ERROR",
+                "error_msg": f"mensagem invalida ou mal-formada: {e}",
+            },
+        )
+        out = msgpack.packb(response, use_bin_type=True)
+
+    rep_socket.send(out)
+    print(f"[SEND] {response}")
+    if not is_peer_message:
+        client_messages_received += 1
+    return is_peer_message
+
+
 def main():
-    global known_logins, known_channels, pub_socket, reference_socket, sub_socket
+    global pub_socket, reference_socket, sub_socket, rep_socket
     global client_messages_received, zmq_context
-    known_logins = persistence.load_logins(LOGINS_PATH)
-    known_channels = persistence.load_channels(CHANNELS_PATH)
-    known_messages = persistence.load_messages(MESSAGES_PATH)
+    load_state()
     print(
         f"[SERVER] Historico carregado: {len(known_logins)} login(s), "
-        f"{len(known_channels)} canal(is) e {len(known_messages)} "
+        f"{len(channel_winners)} canal(is) e {len(known_messages)} "
         f"mensagem(ns) previamente persistido(s)"
     )
 
@@ -685,6 +1070,7 @@ def main():
     socket = context.socket(zmq.REP)
     socket.setsockopt(zmq.RCVTIMEO, IDLE_TICK_MS)
     socket.bind(BIND_ADDRESS)
+    rep_socket = socket
     print(f"[SERVER] Python Server (REP) ouvindo em {BIND_ADDRESS}")
     if SERVER_BROKER_ADDRESS:
         socket.connect(SERVER_BROKER_ADDRESS)
@@ -700,8 +1086,9 @@ def main():
     sub_socket = context.socket(zmq.SUB)
     sub_socket.connect(BROKER_XPUB_ADDRESS)
     sub_socket.setsockopt(zmq.SUBSCRIBE, SERVERS_TOPIC.encode("utf-8"))
+    sub_socket.setsockopt(zmq.SUBSCRIBE, REPLICATION_TOPIC.encode("utf-8"))
     print(f"[SERVER] SUB conectado ao broker em {BROKER_XPUB_ADDRESS}, "
-          f"assinando o topico '{SERVERS_TOPIC}'")
+          f"assinando os topicos '{SERVERS_TOPIC}' e '{REPLICATION_TOPIC}'")
 
     reference_socket = new_reference_socket()
     # O registro inicial NAO e fatal: se o Reference estiver fora do ar, o
@@ -719,39 +1106,12 @@ def main():
                 housekeeping()  # ocioso: registro, eleicao, reanuncio e sincronizacao
                 continue
 
-            # Cada mensagem e tratada isoladamente: qualquer falha ao
-            # decodificar o MessagePack, ou ao processar o envelope
-            # (campos ausentes, tipos inesperados, envelope que nao e um
-            # dict, etc.), e capturada aqui e vira um ERROR_RESPONSE, em
-            # vez de propagar e derrubar o servidor inteiro. O socket REP
-            # exige exatamente 1 send() por recv(), entao SEMPRE
-            # respondemos algo, mesmo em erro.
-            is_peer_message = False
-            try:
-                envelope = msgpack.unpackb(raw, raw=False)
-                observe_message(envelope)
-                print(f"[RECV] {envelope}")
-                is_peer_message = (isinstance(envelope, dict)
-                                   and envelope.get("type") in PEER_TYPES)
-                response = dispatch(envelope)
-                out = msgpack.packb(response, use_bin_type=True)
-            except Exception as e:
-                print(f"[ERROR] Falha ao processar mensagem: {e}")
-                response = build_envelope(
-                    "ERROR_RESPONSE",
-                    {
-                        "status": "ERROR",
-                        "error_msg": f"mensagem invalida ou mal-formada: {e}",
-                    },
-                )
-                out = msgpack.packb(response, use_bin_type=True)
-
-            socket.send(out)
-            print(f"[SEND] {response}")
+            # Cada mensagem e tratada por process_raw(): qualquer falha vira um ERROR_RESPONSE
+            # (o socket REP exige exatamente 1 send() por recv()).
+            is_peer_message = process_raw(raw)
 
             # Depois de responder: nada abaixo atrasa o cliente que acabou de ser atendido.
             if not is_peer_message:
-                client_messages_received += 1
                 after_client_message()
             housekeeping()
     except KeyboardInterrupt:

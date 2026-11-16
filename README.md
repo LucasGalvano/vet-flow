@@ -1,6 +1,6 @@
 # vet_flow — Sistema Distribuído de Mensagens (Clínica Veterinária)
 
-> **Status do código:** Partes 1 a 4 implementadas (Python e Java, com
+> **Status do código:** Partes 1 a 5 implementadas (Python e Java, com
 > interoperabilidade entre as linguagens).
 > Parte 1: login, criação e listagem de canais, com persistência em disco.
 > Parte 2: Pub/Sub via broker (`XSUB` 5557 / `XPUB` 5558), com persistência das
@@ -9,7 +9,9 @@
 > heartbeat) e broker REQ/REP com round-robin entre os servidores.
 > Parte 4: eleição de coordenador (algoritmo do valentão) e sincronização do
 > relógio físico dos servidores com o coordenador.
-> A replicação de dados (Parte 5) ainda **não** está implementada.
+> Parte 5: replicação ativa, sem líder (Pub/Sub no tópico `replication`), com
+> anti-entropia por REQ/REP: todos os servidores guardam todos os dados.
+> Todas as partes do enunciado estão implementadas.
 
 ## Objetivo
 
@@ -32,6 +34,8 @@ O projeto terá 5 partes: (1) login/canais/persistência, (2) Pub/Sub via
 broker, (3) relógios lógicos + heartbeat + Reference Service, (4) eleição
 de coordenador + algoritmo de Berkeley, (5) replicação entre réplicas.
 
+O contrato de mensagens comum entre Python e Java está resumido na seção
+[Formato das mensagens](#formato-das-mensagens).
 
 ## O que já está implementado (Parte 1 — completa)
 
@@ -56,7 +60,8 @@ de coordenador + algoritmo de Berkeley, (5) replicação entre réplicas.
 - Clients (Python e Java): `ACTION=PUBLISH` e `ACTION=SUBSCRIBE`
   (`SUB` direto no broker, escuta por `SUBSCRIBE_SECONDS` e sai).
 - Framing: multipart — frame 1 = tópico (nome do canal, UTF-8, mecanismo de
-  roteamento), frame 2 = envelope completo em MessagePack.
+  roteamento), frame 2 = envelope completo em MessagePack. Ver
+  [Formato das mensagens](#formato-das-mensagens).
 - Interoperabilidade Pub/Sub testada manualmente: Python→Python,
   Java→Java, servidor Python→subscriber Java e servidor Java→subscriber
   Python.
@@ -152,6 +157,102 @@ simula um relógio local errado: no `docker-compose.yml`, `python-server` tem
 - Logs novos: `[ELEICAO]`, `[COORDENADOR]`, `[CLOCK-SYNC]`, `[PEER-SEND]`/`[PEER-RECV]`
   e `[PUB-SEND]`/`[PUBSUB-RECV]` do tópico `servers`.
 
+## O que já está implementado (Parte 5 — consistência e replicação)
+
+### O problema
+
+O broker REQ/REP distribui as requisições dos bots entre os servidores em
+round-robin, então cada servidor recebia só uma parte dos logins, canais e
+mensagens. Se um servidor caísse, essa parte do histórico se perdia, e quem pedisse
+o histórico a um servidor receberia só a parte dele. Na versão final **todos os
+servidores guardam todos os dados**.
+
+### Método escolhido: replicação ativa, sem líder, com consistência eventual
+
+Qualquer servidor aceita escritas (o broker decide qual) e as propaga a todos os
+outros. Não há servidor primário: os servidores são pares. A consistência é
+**eventual**: todos convergem para o mesmo conjunto de dados, na mesma ordem, mas
+um servidor pode estar alguns instantes atrás de outro. Para cobrir a perda de
+mensagens do Pub/Sub, há **anti-entropia** (cada servidor compara o que tem com um
+par e puxa o que falta).
+
+Por que não primário-backup usando o coordenador da Parte 4: ele serializaria todas
+as escritas (consistência mais forte), mas os servidores deixariam de aceitar
+escritas sem coordenador, e cada escrita passaria por um salto extra. Para este
+projeto (bots que só acrescentam dados) a consistência eventual basta e é mais
+simples de manter disponível. O coordenador continua só como referência de relógio.
+
+### Como foi implementado
+
+1. **Identificação:** todo registro (login, canal ou mensagem) recebe um id
+   `(origin, seq)`: `origin` é o servidor que o gravou e `seq` um contador por
+   origem. Também leva `lc`, o relógio lógico no momento da gravação.
+2. **Escrita:** o servidor grava em disco **e só então** publica o registro no
+   tópico `replication` (`REPLICATION`), depois responde ao bot. Os demais servidores
+   assinam esse tópico no `XPUB`, aplicam o registro e o gravam no próprio disco.
+   O registro replicado **não** é republicado no canal dos bots (isso duplicaria a
+   mensagem).
+3. **Idempotência:** aplicar duas vezes o mesmo id não tem efeito, então duplicatas
+   (eco da própria publicação, recebimento por Pub/Sub e por anti-entropia) são
+   inofensivas.
+4. **Anti-entropia (`SYNC_REQUEST`/`SYNC_RESPONSE`):** cada servidor mantém, por
+   origem, o maior `seq` sem buracos. Ele pede a um par os registros acima disso, em
+   lotes de até 500. Isso acontece (a) ao iniciar, com todos os pares conhecidos;
+   (b) quando um registro chega fora de ordem (buraco); (c) periodicamente, com um
+   par por vez, a cada ~10 s (variação aleatória de ±30%). Um servidor com o disco
+   vazio se reconstrói por esse mecanismo, inclusive os registros que ele mesmo
+   tinha originado.
+5. **Ordem:** os registros são ordenados por `(lc, origin, seq)`, o mesmo critério
+   em todos os servidores; a lista de canais e o histórico saem iguais em qualquer
+   um.
+6. **Criações concorrentes do mesmo canal:** duas criações simultâneas do mesmo nome
+   em servidores diferentes são aceitas localmente; depois de replicadas, vale a de
+   menor `(lc, origin, seq)` em todos (a outra fica no disco, mas o nome aparece
+   uma vez). Depois da replicação, criar um nome que já existe em qualquer servidor
+   é recusado.
+7. **Leitura do histórico:** `HISTORY_REQUEST` (`{channel_name, limit}`, até 500)
+   devolve as últimas mensagens do canal, em ordem; qualquer servidor responde.
+8. **Tópicos reservados:** `servers` (Parte 4) e `replication` não podem ser nomes
+   de canal.
+
+### Mudanças e adaptações em relação ao método
+
+- **Transporte:** em vez de um multicast confiável, usa-se o Pub/Sub que já existe
+  (sem garantia de entrega). A anti-entropia é o que compensa; é uma adaptação ao
+  que o projeto oferece.
+- **Id por origem e `lc`:** necessários para detectar buracos, ignorar duplicatas
+  e ordenar igual em todos os servidores.
+- **Espera que também atende:** os servidores se pedem dados uns aos outros. Dois
+  servidores que se pedem algo ao mesmo tempo ficariam bloqueados até o timeout (o
+  que também derrubava a eleição). Por isso, enquanto aguarda a resposta de um par
+  ou do Reference, o servidor continua atendendo o `REP` (só responde; heartbeat e
+  demais tarefas voltam para o loop principal). Continua sem threads.
+- **Heartbeat e sincronização de relógio** passaram a usar a contagem acumulada de
+  mensagens de clientes (mensagens atendidas durante uma espera também contam).
+- **Persistência:** os servidores mantêm as listas em memória e regravam o arquivo
+  (escrita atômica); registros replicados recebidos no mesmo ciclo são gravados de
+  uma vez. Dados de versões anteriores (sem id) são migrados ao iniciar.
+- Bots, brokers e Reference **não** mudaram.
+
+### Garantias e limitações
+
+- **Convergência:** enquanto os servidores se enxergam, os dados convergem em
+  segundos mesmo com perda de mensagens do Pub/Sub ou queda e volta de servidores.
+- **Servidor que cai com um registro ainda não replicado** (gravou em disco, mas
+  caiu antes de publicar): o registro aparece nos demais quando ele voltar. Se o
+  disco dele for perdido junto, o registro se perde.
+- **Buraco permanente:** se um registro nunca chega, os `seq` seguintes dessa origem
+  continuam sendo reenviados em cada anti-entropia (limitado a um lote por rodada).
+- **Disco apagado de um servidor com os pares no ar:** ele se reconstrói, mas
+  gravações de clientes recebidas **antes** da primeira anti-entropia poderiam
+  reutilizar ids. Na prática a sincronização inicial roda assim que o servidor
+  se registra no Reference, antes dos bots.
+- **Custo:** cada escrita regrava o arquivo inteiro da lista; adequado a este
+  porte, não a milhões de registros. Não há compactação nem remoção de dados.
+- **Relógios lógicos:** a ordem do histórico respeita causalidade, mas mensagens
+  concorrentes de bots diferentes não têm ordem "real" definida; o desempate é
+  `(origin, seq)`.
+
 ## Estrutura de diretórios
 
 ```
@@ -173,7 +274,8 @@ projeto/
 ├── tests/
 │   ├── test_publish_validation.py   # contrato do PUBLISH_REQUEST (qualquer servidor)
 │   ├── test_part3.py                # ranks e disponibilidade
-│   └── list_servers.py              # consulta a lista de servidores no Reference
+│   ├── list_servers.py              # consulta a lista de servidores no Reference
+│   └── check_replication.py         # compara canais e históricos entre os servidores (Parte 5)
 ├── python/
 │   ├── server/            # server.py, persistence.py, requirements.txt, Dockerfile
 │   └── client/            # client.py, requirements.txt, Dockerfile
@@ -241,6 +343,8 @@ obrigatória — todas têm valor padrão seguro no código.
 | `ELECTION_WAIT_SECONDS` | server | `5` | Espera pelo anúncio depois de um servidor maior responder OK |
 | `COORDINATOR_ANNOUNCE_SECONDS` | server | `5` | Intervalo da republicação do anúncio pelo coordenador |
 | `CLOCK_SKEW_MS` | server | `0` | Desvio artificial do relógio local (demonstração da sincronização) |
+| `REPL_SYNC_SECONDS` | server | `10` | Intervalo (±30%) da anti-entropia periódica com um par |
+| `REPL_BATCH` | server | `500` | Máximo de registros por `SYNC_RESPONSE` |
 | `SERVER_NAME` | server | nome da implementação | Nome único usado no registro e heartbeat |
 | `HEARTBEAT_EVERY` | server | `10` | Mensagens de clientes entre heartbeats |
 | `REFERENCE_TIMEOUT_MS` | server | `1000` | Quanto o servidor espera a resposta do Reference Service em cada troca (registro/heartbeat). **Não confundir** com `REFERENCE_TIMEOUT_SECONDS`, que é do lado do Reference |
@@ -405,7 +509,7 @@ timestamp de envio e timestamp local de recebimento.
 ## Escolhas de projeto
 
 - **Linguagens:** Python e Java. Cada uma tem cliente (bot) e servidor completos,
-  e todos falam o mesmo protocolo. O projeto é
+  e todos falam o mesmo protocolo (ver [Formato das mensagens](#formato-das-mensagens)). O projeto é
   individual, então as duas linguagens atendem ao requisito mínimo.
 - **Troca de mensagens:** ZeroMQ. REQ/REP entre bots e servidores (passando pelo
   broker REQ/REP) e entre servidores e Reference Service; PUB/SUB para a
@@ -417,6 +521,40 @@ timestamp de envio e timestamp local de recebimento.
   arquivos MessagePack (`logins`, `channels`, `messages`), cada um contendo uma
   lista de registros. A escrita é atômica (arquivo temporário + rename) e um
   arquivo corrompido é preservado como `*.corrupt` em vez de ser sobrescrito.
+
+## Formato das mensagens
+
+Todas as mensagens (REQ/REP e Pub/Sub) são serializadas em **MessagePack** e
+usam o mesmo envelope, em qualquer linguagem:
+
+| Campo | Descrição |
+|---|---|
+| `type` | Tipo da mensagem (tabela abaixo) |
+| `sender_id` | Nome de quem envia (bot ou servidor) |
+| `sender_lang` | `python` ou `java` |
+| `timestamp` | Hora física do envio, em ms (Unix epoch) |
+| `logical_clock` | Relógio lógico de quem envia |
+| `payload` | Mapa com os dados do tipo |
+
+Nas respostas, `payload.status` é `OK` ou `ERROR` (com `error_msg`).
+
+| Tipo | Canal | Payload |
+|---|---|---|
+| `LOGIN_REQUEST` / `LOGIN_RESPONSE` | REQ/REP bot→servidor | `{bot_name}` / `{status}` |
+| `CHANNEL_CREATE_REQUEST` / `CHANNEL_CREATE_RESPONSE` | REQ/REP | `{channel_name, bot_name}` / `{status}` |
+| `CHANNEL_LIST_REQUEST` / `CHANNEL_LIST_RESPONSE` | REQ/REP | `{}` / `{channels: [nomes]}` |
+| `PUBLISH_REQUEST` / `PUBLISH_RESPONSE` | REQ/REP | `{channel_name, message}` / `{status}` |
+| `CHANNEL_MESSAGE` | PUB/SUB, tópico = nome do canal (2 frames: tópico + envelope) | `{channel_name, message}` |
+| `REFERENCE_REGISTER_REQUEST` | REQ/REP servidor→Reference | `{server_name}` → `{status, rank}` |
+| `REFERENCE_LIST_REQUEST` | REQ/REP | `{}` → `{status, servers: [{name, rank}]}` |
+| `REFERENCE_HEARTBEAT_REQUEST` | REQ/REP | `{server_name}` → `{status, rank}` |
+| `ELECTION_REQUEST` / `ELECTION_RESPONSE` | REQ/REP servidor→servidor | `{rank}` / `{status, rank}` |
+| `CLOCK_REQUEST` / `CLOCK_RESPONSE` | REQ/REP servidor→coordenador | `{}` / `{status, time_ms}` |
+| `COORDINATOR_ANNOUNCEMENT` | PUB, tópico `servers` | `{coordinator, rank}` |
+| `HISTORY_REQUEST` / `HISTORY_RESPONSE` | REQ/REP bot→servidor | `{channel_name, limit?}` / `{status, channel_name, total, messages: [{origin, seq, sender_id, sender_lang, message, timestamp}]}` |
+| `REPLICATION` | PUB, tópico `replication` | `{kind: login\|channel\|message, record}` (o registro leva `origin`, `seq`, `lc`) |
+| `SYNC_REQUEST` / `SYNC_RESPONSE` | REQ/REP servidor→servidor | `{have: {origem: maior seq sem buracos}, limit}` / `{status, records: [{kind, record}], more}` |
+| `ERROR_RESPONSE` | REP | `{status: "ERROR", error_msg}` (mensagem inválida ou tipo desconhecido) |
 
 ## Brokers
 
@@ -430,18 +568,20 @@ O projeto tem **dois** brokers independentes:
   continuam podendo falar direto com um servidor específico.
 - `broker/`: proxy Pub/Sub, `XSUB` 5557 / `XPUB` 5558.
 
-**Limitação até a Parte 5:** como cada servidor guarda só uma parte dos dados,
-um bot de loop que passa pelo broker REQ/REP pode listar canais em um servidor
-e publicar em outro que não conhece o canal. Isso aparece nos logs como
-`publicação recusada: canal ... nao existe`. É esperado e será resolvido pela
-replicação da Parte 5.
+**Dados entre servidores:** o `DEALER` entrega cada requisição a um servidor diferente,
+então um bot pode listar canais em um servidor e publicar em outro. Desde a Parte 5
+todos os servidores guardam todos os dados (ver "Parte 5"), de modo que qualquer um
+atende qualquer requisição.
 
 ## Logs
 
 Todo envio e recebimento é impresso com o conteúdo completo do envelope:
 `[SEND]`/`[RECV]` (cliente-servidor), `[REF-SEND]`/`[REF-RECV]`
 (servidor-Reference), `[PUB-SEND]` (publicação no tópico) e `[PUBSUB-RECV]`
-(bot recebendo, com `timestamp_envio` e `timestamp_recebimento`).
+(bot recebendo, com `timestamp_envio` e `timestamp_recebimento`). Na replicação:
+`[REPLICA-SEND]`/`[REPLICA-RECV]` (um registro por mensagem, conteúdo completo) e,
+para os lotes de anti-entropia (até 500 registros), um resumo em
+`[PEER-SEND]`/`[PEER-RECV]` e `[SYNC]`.
 
 ## Execução Docker
 
@@ -509,9 +649,12 @@ Python (`pyzmq`, `msgpack`).
 
 ## Demonstração Pub/Sub
 
-O `docker-compose.yml` cria o canal `avisos-clinica` nos dois servidores, um
-publisher em cada servidor publica uma mensagem e dois subscribers (Python e Java)
-escutam o broker Pub/Sub; cada subscriber deve receber as duas mensagens. Os
+O `docker-compose.yml` cria o canal `avisos-clinica` **uma vez**, no servidor Python
+(desde a Parte 5 os canais são replicados, então criar o mesmo nome nos dois
+servidores seria recusado com `canal já existe`). Um publisher em cada servidor publica
+uma mensagem, o do servidor Java em um canal criado no outro servidor, e dois
+subscribers (Python e Java) escutam o broker Pub/Sub; cada subscriber deve receber as
+duas mensagens. Os
 publishers esperam 8 s antes de publicar (`sleep` no `command`): o Pub/Sub do
 ZeroMQ não sinaliza "assinatura ativa" (*slow joiner*), e sem o atraso a
 mensagem poderia sair antes de o subscriber Java terminar de assinar. Em máquinas
@@ -519,11 +662,9 @@ lentas, aumente esse valor.
 
 ## Limitações conhecidas
 
-- **Dados divergentes entre servidores (até a Parte 5):** o broker REQ/REP
-  distribui em round-robin e cada servidor guarda só parte dos dados. Um bot pode
-  listar canais em um servidor e publicar em outro que não conhece o canal
-  (`publicação recusada: canal ... nao existe`). Esperado; a replicação da
-  Parte 5 resolve.
+- **Consistência eventual (Parte 5):** logo depois de uma escrita, um servidor pode
+  ainda não ter o registro (janela de milissegundos no caso normal; até a próxima
+  anti-entropia se uma publicação se perder). Ver "Garantias e limitações" na Parte 5.
 - **Prefix match no Pub/Sub:** assinar `vac` também recebe `vacinas`.
 - **Servidores ociosos saem da lista do Reference:** o heartbeat só sai a cada 10
   mensagens de clientes. Sem tráfego por 30 s o servidor some da lista, e um
@@ -540,9 +681,22 @@ lentas, aumente esse valor.
 
 ## Validação da Parte 4
 
-A lógica de eleição e sincronização foi exercitada com servidores Python locais
-(subida em ordem, queda e volta do coordenador, resposta `OK` de servidor maior).
-Para validar em Docker:
+Executada em Docker Desktop (Windows), com build limpo e sem dados residuais
+(`docker compose down`, apagar os `.msgpack`, `docker compose up --build -d`):
+
+| Verificação | Resultado |
+|---|---|
+| Eleição inicial | Os dois se elegem no início (ainda não se enxergam no Reference); em seguida o `python-server` recebe o anúncio de rank 2 e passa a tratar o `java-server` como coordenador |
+| Sincronização (Python → Java) | `python-server` corrige +2014 ms (desfaz o `CLOCK_SKEW_MS=-2000`) e depois −9 ms, −2 ms; o ajuste converge para ~2003 ms. `java-server` fica com `ajuste=0ms` (referência) |
+| Anúncio periódico | `COORDINATOR_ANNOUNCEMENT` do `java-server` no tópico `servers` a cada ~5 s |
+| Heartbeat sem hora | `reference_time_ms` não aparece mais nos logs do `reference-service` |
+| Queda do coordenador | `docker compose stop java-server`: no próximo `CLOCK-SYNC` o `python-server` mostra `indisponivel`, inicia a eleição, o `java-server` não responde e o `python-server` é eleito coordenador |
+| Volta do coordenador | `docker compose start java-server`: o `python-server` adota o anúncio do `java-server` (`novo coordenador: java-server`) e volta a sincronizar, com correções de poucos ms |
+
+A lógica também foi exercitada com servidores Python locais (ordem de subida,
+queda e volta do coordenador, resposta `OK` de servidor de rank maior).
+
+Para repetir:
 
 ```powershell
 docker compose down
@@ -550,18 +704,54 @@ Remove-Item -Force .\python\server\data\*.msgpack, .\java\server\data\*.msgpack 
 docker compose up --build -d
 Start-Sleep 30
 docker compose logs python-server java-server | Select-String "ELEICAO|COORDENADOR|CLOCK-SYNC"
+docker compose stop java-server; Start-Sleep 25
+docker compose logs python-server | Select-String "indisponivel|ELEICAO|COORDENADOR" | Select-Object -Last 6
+docker compose start java-server; Start-Sleep 25
+docker compose logs python-server | Select-String "COORDENADOR|CLOCK-SYNC" | Select-Object -Last 6
 ```
 
-| Verificação | Esperado |
-|---|---|
-| Eleição inicial | `java-server` (rank 2) vira coordenador; `python-server` registra `novo coordenador: java-server` |
-| Sincronização | `python-server` mostra `[CLOCK-SYNC] ... correcao=+2000ms` (desfaz o desvio) e depois correções de poucos ms |
-| Anúncio | `[PUBSUB-RECV] topic=servers` nos dois servidores, a cada ~5 s |
-| Queda do coordenador | `docker compose stop java-server` → no próximo `CLOCK-SYNC` o `python-server` mostra `indisponivel` e `eleito coordenador` |
-| Volta do coordenador | `docker compose start java-server` → `java-server` se elege de novo e o `python-server` adota o anúncio |
-| Heartbeat sem hora | `docker compose logs reference-service \| Select-String "reference_time_ms"` não retorna nada |
+## Validação da Parte 5
 
-## Próximos passos
+**Em Docker:**
 
-Parte 5: replicação dos dados (logins, canais e mensagens) entre todos os
-servidores, para que cada um tenha o histórico completo.
+```powershell
+docker compose down
+Remove-Item -Force .\python\server\data\*.msgpack, .\java\server\data\*.msgpack -ErrorAction SilentlyContinue
+docker compose up --build -d
+Start-Sleep 45
+python tests\check_replication.py        # compara canais e históricos dos dois servidores
+docker compose logs python-server java-server | Select-String "REPLICA-RECV" | Select-Object -Last 4
+docker compose logs bot-loop-python bot-loop-java | Select-String "nao existe"   # (quase) nenhum
+```
+
+`tests/check_replication.py` consulta o servidor Python (`localhost:5555`) e o Java
+(`localhost:5556`), compara a lista de canais e o histórico de cada canal (ignora as
+mensagens dos últimos 10 s, porque os bots continuam publicando) e repete por até
+30 s. Imprime `IGUAIS` e termina com código 0 quando os dois coincidem
+(requer `pip install pyzmq msgpack`).
+
+Recuperação depois de uma queda:
+
+```powershell
+docker compose stop java-server; Start-Sleep 20
+docker compose start java-server; Start-Sleep 25
+docker compose logs java-server | Select-String "sincronizado com"
+python tests\check_replication.py
+```
+
+O esperado é `[SYNC] sincronizado com python-server: N registro(s) novo(s)` no Java
+(as mensagens que ele perdeu) e `IGUAIS` no final.
+
+**Em teste local** (dois servidores Python, broker e Reference reais): escritas em
+ambos os servidores aparecem nos dois com a mesma ordem; criar um canal que existe no
+outro servidor é recusado; um servidor parado perde 5 mensagens e as recupera ao
+voltar; um servidor com o disco apagado se reconstrói por completo (inclusive os
+próprios registros) e as escritas seguintes dele continuam a numeração; dois
+servidores que se pedem dados ao mesmo tempo (inicialização simultânea) não se
+bloqueiam.
+
+## Estado do projeto
+
+As cinco partes do enunciado estão implementadas: login e canais (1), Pub/Sub e
+persistência (2), relógios lógicos e referência (3), eleição e sincronização de
+relógio (4) e replicação dos dados (5).

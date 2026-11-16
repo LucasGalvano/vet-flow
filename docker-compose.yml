@@ -143,10 +143,12 @@ services:
         condition: service_completed_successfully
 
   # --- Parte 2: Pub/Sub via broker ---
-  # Canal 'avisos-clinica' criado nos DOIS servidores; um publisher em
-  # cada um; dois subscribers (Python e Java) escutando o broker. Cada
-  # subscriber deve receber as DUAS mensagens (uma publicada pelo
-  # servidor Python, outra pelo servidor Java).
+  # Canal 'avisos-clinica' criado UMA vez, no servidor Python. Desde a Parte 5 os
+  # servidores replicam os canais, entao o servidor Java ja o conhece (criar o mesmo
+  # canal nos dois seria recusado: "canal ja existe"). Um publisher em cada servidor;
+  # dois subscribers (Python e Java) escutando o broker. Cada subscriber deve receber
+  # as DUAS mensagens (uma publicada pelo servidor Python, outra pelo servidor Java --
+  # que publica em um canal criado no outro servidor, gracas a replicacao).
 
   bot-ps-create-on-pyserver:
     build: ./java/client
@@ -158,18 +160,6 @@ services:
       RECV_TIMEOUT_MS: "15000"
     depends_on:
       python-server:
-        condition: service_started
-
-  bot-ps-create-on-javaserver:
-    build: ./python/client
-    environment:
-      SERVER_ADDRESS: tcp://java-server:5555
-      BOT_NAME: bot-python-cria-canal-no-java
-      ACTION: CHANNEL_CREATE
-      CHANNEL_NAME: avisos-clinica
-      RECV_TIMEOUT_MS: "15000"
-    depends_on:
-      java-server:
         condition: service_started
 
   bot-ps-subscriber-py:
@@ -225,7 +215,7 @@ services:
       MESSAGE: "Recepcionista Joana registrou a limpeza da clinica as 08:00 (via servidor Java)"
       RECV_TIMEOUT_MS: "15000"
     depends_on:
-      bot-ps-create-on-javaserver:
+      bot-ps-create-on-pyserver:
         condition: service_completed_successfully
 
   # Bots padronizados do enunciado: completam até 5 canais, assinam 3 e
