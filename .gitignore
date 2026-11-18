@@ -1,63 +1,21 @@
-# =========================================================
-# Python
-# =========================================================
-__pycache__/
-*.py[cod]
-*$py.class
-*.egg-info/
-.venv/
-venv/
-env/
-.python-version
-
-# =========================================================
-# Java (quando a implementacao Java existir)
-# =========================================================
-target/
-build/
-*.class
-*.jar
-*.war
-.gradle/
-
-# =========================================================
-# IDEs
-# =========================================================
-.idea/
-.vscode/
-*.iml
-.classpath
-.project
-.settings/
-
-# =========================================================
-# Variaveis de ambiente
-# =========================================================
-# .env.example DEVE ser versionado; .env (com valores reais/locais) nao.
-.env
-.env.*.local
-
-# =========================================================
-# Sistema operacional
-# =========================================================
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# =========================================================
-# Logs / arquivos temporarios de execucao
-# =========================================================
-*.log
-*.tmp
-*.pid
-
-# =========================================================
-# Dados de persistencia (gerados em runtime pelos servidores)
-# -----------------------------------------------------------
-# A Parte 1 AINDA NAO persiste nada em disco. Este bloco antecipa os
-# caminhos de dados que serao criados quando a persistencia (proximo
-# passo) for implementada, para que dados locais de cada dev nao sejam
-# commitados por engano. Ajustar aqui quando o caminho real for definido.
-# =========================================================
+# Dados persistidos pelos servidores (bind mount do compose)
 python/server/data/
 java/server/data/
+*.msgpack
+*.corrupt
+*.tmp
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+tests/
+
+# Java / Maven
+target/
+
+# Ambiente e editores
+.env
+.idea/
+.vscode/

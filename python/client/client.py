@@ -1,22 +1,10 @@
-"""
-Python Client (bot) - Parte 1 + Parte 2
-
-Escopo:
-    - ACTION=LOGIN / CHANNEL_CREATE / CHANNEL_LIST / PUBLISH:
-      socket ZeroMQ REQ contra o servidor (Parte 1 + PUBLISH_REQUEST).
-    - ACTION=SUBSCRIBE: socket ZeroMQ SUB conectado DIRETO no broker
-      (Parte 2), nao no servidor -- escuta por SUBSCRIBE_SECONDS e sai.
-
-O client eh um bot: nao ha nenhuma interacao manual. Nome do bot,
-endereco do servidor/broker e a acao a executar vem de variaveis de
-ambiente (facilita configurar via Docker Compose futuramente, sem mudar
-codigo).
-
-Ver contrato completo em protocol/PROTOCOL.md.
-"""
+"""Bot Python do vet_flow (Partes 1, 2 e relógio lógico da Parte 3)."""
 
 import os
+import random
+import re
 import sys
+import threading
 import time
 
 import msgpack
@@ -27,128 +15,205 @@ BROKER_ADDRESS = os.environ.get("BROKER_ADDRESS", "tcp://localhost:5558")
 BOT_NAME = os.environ.get("BOT_NAME", "bot-python-1")
 ACTION = os.environ.get("ACTION", "LOGIN").upper()
 CHANNEL_NAME = os.environ.get("CHANNEL_NAME", "avisos-gerais")
+CHANNELS = [name.strip() for name in os.environ.get("CHANNELS", CHANNEL_NAME).split(",") if name.strip()]
 MESSAGE = os.environ.get("MESSAGE", "mensagem de teste")
 SUBSCRIBE_SECONDS = float(os.environ.get("SUBSCRIBE_SECONDS", "5"))
-
-# Timeout de recepcao: evita que o bot fique bloqueado para sempre caso o
-# servidor nao responda. Importante porque o projeto nao pode depender de
-# interacao manual (regra do enunciado) -- o bot precisa poder desistir
-# sozinho e sinalizar erro via exit code.
 RECV_TIMEOUT_MS = int(os.environ.get("RECV_TIMEOUT_MS", "5000"))
+BOT_DELAY_SECONDS = float(os.environ.get("BOT_DELAY_SECONDS", "1"))
+
+logical_clock = 0
+clock_lock = threading.Lock()
+
+
+def observe_message(envelope: dict) -> None:
+    global logical_clock
+    received = envelope.get("logical_clock", 0)
+    # Mesma faixa aceita pelos servidores (ver server.py): ignora valor invalido.
+    if isinstance(received, int) and not isinstance(received, bool) and 0 <= received <= 2**63 - 2:
+        with clock_lock:
+            logical_clock = max(logical_clock, received)
 
 
 def build_envelope(msg_type: str, payload: dict) -> dict:
+    global logical_clock
+    with clock_lock:
+        logical_clock += 1
+        clock = logical_clock
     return {
         "type": msg_type,
         "sender_id": BOT_NAME,
         "sender_lang": "python",
         "timestamp": int(time.time() * 1000),
+        "logical_clock": clock,
         "payload": payload,
     }
 
 
-def build_request() -> dict:
-    """Monta o envelope de requisicao de acordo com ACTION."""
-    if ACTION == "LOGIN":
-        return build_envelope("LOGIN_REQUEST", {"bot_name": BOT_NAME})
-
-    if ACTION == "CHANNEL_CREATE":
-        return build_envelope(
-            "CHANNEL_CREATE_REQUEST",
-            {"channel_name": CHANNEL_NAME, "bot_name": BOT_NAME},
-        )
-
-    if ACTION == "CHANNEL_LIST":
-        return build_envelope("CHANNEL_LIST_REQUEST", {})
-
-    if ACTION == "PUBLISH":
-        return build_envelope(
-            "PUBLISH_REQUEST",
-            {"channel_name": CHANNEL_NAME, "message": MESSAGE},
-        )
-
-    print(f"[CLIENT] ACTION desconhecida: '{ACTION}'")
-    sys.exit(1)
+def request(socket, msg_type: str, payload: dict) -> dict:
+    envelope = build_envelope(msg_type, payload)
+    socket.send(msgpack.packb(envelope, use_bin_type=True))
+    print(f"[SEND] {envelope}")
+    response = msgpack.unpackb(socket.recv(), raw=False)
+    observe_message(response)
+    print(f"[RECV] {response}")
+    return response
 
 
-def print_result(response: dict) -> None:
-    """Interpreta a resposta de acordo com seu 'type' e imprime um resumo."""
-    resp_type = response.get("type")
-    payload = response.get("payload", {})
-
-    if resp_type == "CHANNEL_LIST_RESPONSE":
-        channels = payload.get("channels", [])
-        print(f"[CLIENT] Canais existentes ({len(channels)}): {channels}")
-        return
-
-    # LOGIN_RESPONSE e CHANNEL_CREATE_RESPONSE seguem a mesma convencao
-    # de status/error_msg (ver protocol/PROTOCOL.md).
-    if payload.get("status") == "OK":
-        print(f"[CLIENT] Acao '{ACTION}' concluida com sucesso.")
-    else:
-        error = payload.get("error_msg", "erro desconhecido")
-        print(f"[CLIENT] Acao '{ACTION}' falhou: {error}")
-        sys.exit(1)
-
-
-def run_subscribe():
-    """ACTION=SUBSCRIBE: conecta direto no broker (nao no servidor),
-    assina CHANNEL_NAME e escuta por SUBSCRIBE_SECONDS antes de sair.
-    Fluxo totalmente separado do REQ/REP usado pelas outras acoes."""
-    context = zmq.Context()
-    sub = context.socket(zmq.SUB)
-    sub.connect(BROKER_ADDRESS)
-    sub.setsockopt(zmq.SUBSCRIBE, CHANNEL_NAME.encode("utf-8"))
-    sub.setsockopt(zmq.RCVTIMEO, 500)
-    print(
-        f"[CLIENT] '{BOT_NAME}' assinando canal '{CHANNEL_NAME}' em "
-        f"{BROKER_ADDRESS} por {SUBSCRIBE_SECONDS}s"
-    )
-
-    received = []
-    deadline = time.time() + SUBSCRIBE_SECONDS
-    try:
-        while time.time() < deadline:
-            try:
-                topic, body = sub.recv_multipart()
-                envelope = msgpack.unpackb(body, raw=False)
-                print(f"[RECV] topico={topic.decode()} envelope={envelope}")
-                received.append(envelope)
-            except zmq.error.Again:
-                continue
-    finally:
-        sub.close()
-        context.term()
-
-    print(f"[CLIENT] total de mensagens recebidas: {len(received)}")
-
-
-def main():
-    if ACTION == "SUBSCRIBE":
-        run_subscribe()
-        return
-
-    context = zmq.Context()
+def make_req(context):
     socket = context.socket(zmq.REQ)
     socket.setsockopt(zmq.RCVTIMEO, RECV_TIMEOUT_MS)
     socket.setsockopt(zmq.LINGER, 0)
     socket.connect(SERVER_ADDRESS)
-    print(f"[CLIENT] '{BOT_NAME}' conectando em {SERVER_ADDRESS} (ACTION={ACTION})")
+    return socket
 
-    request = build_request()
-    socket.send(msgpack.packb(request, use_bin_type=True))
-    print(f"[SEND] {request}")
 
+def payload_ok(response):
+    return (response.get("payload") or {}).get("status") == "OK"
+
+
+def channel_list(socket):
+    response = request(socket, "CHANNEL_LIST_REQUEST", {})
+    return (response.get("payload") or {}).get("channels", [])
+
+
+def receive_loop(context, channels, stop):
+    # O socket é criado e usado pela mesma thread, como exige o ZeroMQ.
+    sub = context.socket(zmq.SUB)
+    sub.setsockopt(zmq.RCVTIMEO, 300)
+    sub.connect(BROKER_ADDRESS)
+    for channel in channels:
+        sub.setsockopt(zmq.SUBSCRIBE, channel.encode("utf-8"))
+    while not stop.is_set():
+        try:
+            topic, body = sub.recv_multipart()
+            envelope = msgpack.unpackb(body, raw=False)
+            observe_message(envelope)
+            received_at = int(time.time() * 1000)
+            print(f"[PUBSUB-RECV] canal={topic.decode('utf-8')} "
+                  f"mensagem={envelope.get('payload', {}).get('message')} "
+                  f"timestamp_envio={envelope.get('timestamp')} "
+                  f"timestamp_recebimento={received_at} "
+                  f"logical_clock={envelope.get('logical_clock')}")
+        except zmq.error.Again:
+            continue
+    sub.close()
+
+
+def run_subscribe(context, channels, duration=None):
+    if duration is None:
+        stop = threading.Event()
+        thread = threading.Thread(target=receive_loop, args=(context, channels, stop), daemon=True)
+        thread.start()
+        print(f"[CLIENT] '{BOT_NAME}' inscrito nos canais {channels} via {BROKER_ADDRESS}")
+        return stop, thread
+
+    sub = context.socket(zmq.SUB)
+    sub.setsockopt(zmq.RCVTIMEO, 300)
+    sub.connect(BROKER_ADDRESS)
+    for channel in channels:
+        sub.setsockopt(zmq.SUBSCRIBE, channel.encode("utf-8"))
+    print(f"[CLIENT] '{BOT_NAME}' inscrito nos canais {channels} via {BROKER_ADDRESS}")
+    deadline = time.time() + duration
+    received = 0
+    while time.time() < deadline:
+        try:
+            topic, body = sub.recv_multipart()
+            envelope = msgpack.unpackb(body, raw=False)
+            observe_message(envelope)
+            received_at = int(time.time() * 1000)
+            print(f"[PUBSUB-RECV] canal={topic.decode('utf-8')} "
+                  f"mensagem={envelope.get('payload', {}).get('message')} "
+                  f"timestamp_envio={envelope.get('timestamp')} "
+                  f"timestamp_recebimento={received_at} "
+                  f"logical_clock={envelope.get('logical_clock')}")
+            received += 1
+        except zmq.error.Again:
+            pass
+    sub.close()
+    print(f"[CLIENT] total de mensagens recebidas: {received}")
+
+
+def run_bot_loop(context):
+    req = make_req(context)
+    login = request(req, "LOGIN_REQUEST", {"bot_name": BOT_NAME})
+    if not payload_ok(login):
+        raise RuntimeError("login recusado")
+
+    channels = channel_list(req)
+    base = re.sub(r"[^a-zA-Z0-9_-]", "-", BOT_NAME).lower()[:30]
+    attempt = 0
+    # Com o broker REQ/REP (round-robin) a listagem e a criacao podem cair em
+    # servidores diferentes; por isso tambem contamos os canais que ESTE bot criou.
+    created_names = set()
+    while len(set(channels) | created_names) < 5 and attempt < 20:
+        name = f"canal-{base}-{attempt + 1}"
+        response = request(req, "CHANNEL_CREATE_REQUEST", {
+            "channel_name": name, "bot_name": BOT_NAME,
+        })
+        if payload_ok(response):
+            created_names.add(name)
+        else:
+            print(f"[CLIENT] canal não criado: {(response.get('payload') or {}).get('error_msg')}")
+        channels = channel_list(req)
+        attempt += 1
+    if not channels:
+        channels = sorted(created_names)
+    if not channels:
+        raise RuntimeError("servidor não possui canais para publicar")
+
+    subscribed = random.sample(channels, min(3, len(channels)))
+    stop, thread = run_subscribe(context, subscribed)
     try:
-        raw = socket.recv()
-        response = msgpack.unpackb(raw, raw=False)
-        print(f"[RECV] {response}")
-        print_result(response)
-    except zmq.error.Again:
-        print("[CLIENT] Timeout: servidor nao respondeu dentro do prazo")
-        sys.exit(1)
+        while True:
+            fresh = channel_list(req)  # canais criados por outros bots entram no sorteio
+            if fresh:
+                channels = fresh
+            channel = random.choice(channels)
+            for index in range(1, 11):
+                message = f"{BOT_NAME}: mensagem {index} no canal {channel}"
+                response = request(req, "PUBLISH_REQUEST", {
+                    "channel_name": channel, "message": message,
+                })
+                if not payload_ok(response):
+                    print(f"[CLIENT] publicação recusada: {(response.get('payload') or {}).get('error_msg')}")
+                time.sleep(BOT_DELAY_SECONDS)
     finally:
+        stop.set()
+        thread.join(timeout=1)
+        req.close()
+
+
+def build_one_shot():
+    if ACTION == "LOGIN":
+        return "LOGIN_REQUEST", {"bot_name": BOT_NAME}
+    if ACTION == "CHANNEL_CREATE":
+        return "CHANNEL_CREATE_REQUEST", {"channel_name": CHANNEL_NAME, "bot_name": BOT_NAME}
+    if ACTION == "CHANNEL_LIST":
+        return "CHANNEL_LIST_REQUEST", {}
+    if ACTION == "PUBLISH":
+        return "PUBLISH_REQUEST", {"channel_name": CHANNEL_NAME, "message": MESSAGE}
+    raise ValueError(f"ACTION desconhecida: {ACTION}")
+
+
+def main():
+    context = zmq.Context()
+    try:
+        if ACTION == "SUBSCRIBE":
+            run_subscribe(context, CHANNELS, SUBSCRIBE_SECONDS)
+            return
+        if ACTION in ("BOT", "BOT_LOOP"):
+            run_bot_loop(context)
+            return
+        socket = make_req(context)
+        msg_type, payload = build_one_shot()
+        response = request(socket, msg_type, payload)
+        if msg_type == "CHANNEL_LIST_REQUEST":
+            print(f"[CLIENT] Canais existentes: {(response.get('payload') or {}).get('channels', [])}")
+        elif not payload_ok(response):
+            print(f"[CLIENT] erro: {(response.get('payload') or {}).get('error_msg')}")
+            sys.exit(1)
         socket.close()
+    finally:
         context.term()
 
 

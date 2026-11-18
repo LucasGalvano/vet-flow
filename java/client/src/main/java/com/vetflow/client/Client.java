@@ -6,178 +6,233 @@ import org.zeromq.SocketType;
 import org.zeromq.ZContext;
 import org.zeromq.ZMQ;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Random;
+import java.util.Set;
 
-/**
- * Java Client (bot) - Parte 1 + Parte 2
- *
- * Espelha o comportamento de python/client/client.py:
- *   ACTION=LOGIN / CHANNEL_CREATE / CHANNEL_LIST / PUBLISH:
- *     socket ZeroMQ REQ contra o servidor.
- *   ACTION=SUBSCRIBE: socket ZeroMQ SUB conectado DIRETO no broker
- *     (Parte 2), nao no servidor -- escuta por SUBSCRIBE_SECONDS e sai.
- *
- * O client eh um bot: nao ha interacao manual. Nome do bot, endereco do
- * servidor/broker e a acao vem de variaveis de ambiente.
- */
+/** Bot Java compatível com o cliente Python e com o protocolo MessagePack. */
 public class Client {
-
     private static final ObjectMapper MAPPER = new ObjectMapper(new MessagePackFactory());
-
-    private static final String SERVER_ADDRESS =
-            System.getenv().getOrDefault("SERVER_ADDRESS", "tcp://localhost:5555");
-    private static final String BROKER_ADDRESS =
-            System.getenv().getOrDefault("BROKER_ADDRESS", "tcp://localhost:5558");
-    private static final String BOT_NAME =
-            System.getenv().getOrDefault("BOT_NAME", "bot-java-1");
-    private static final String ACTION =
-            System.getenv().getOrDefault("ACTION", "LOGIN").toUpperCase();
-    private static final String CHANNEL_NAME =
-            System.getenv().getOrDefault("CHANNEL_NAME", "avisos-gerais");
-    private static final String MESSAGE =
-            System.getenv().getOrDefault("MESSAGE", "mensagem de teste");
-    private static final double SUBSCRIBE_SECONDS =
-            Double.parseDouble(System.getenv().getOrDefault("SUBSCRIBE_SECONDS", "5"));
-
-    // Timeout de recepcao: evita que o bot fique bloqueado para sempre
-    // caso o servidor nao responda. Importante porque o projeto nao pode
-    // depender de interacao manual -- o bot precisa poder desistir
-    // sozinho e sinalizar erro via exit code.
-    private static final int RECV_TIMEOUT_MS =
-            Integer.parseInt(System.getenv().getOrDefault("RECV_TIMEOUT_MS", "5000"));
+    private static final String SERVER_ADDRESS = System.getenv().getOrDefault("SERVER_ADDRESS", "tcp://localhost:5555");
+    private static final String BROKER_ADDRESS = System.getenv().getOrDefault("BROKER_ADDRESS", "tcp://localhost:5558");
+    private static final String BOT_NAME = System.getenv().getOrDefault("BOT_NAME", "bot-java-1");
+    private static final String ACTION = System.getenv().getOrDefault("ACTION", "LOGIN").toUpperCase();
+    private static final String CHANNEL_NAME = System.getenv().getOrDefault("CHANNEL_NAME", "avisos-gerais");
+    private static final String CHANNELS_ENV = System.getenv().getOrDefault("CHANNELS", CHANNEL_NAME);
+    private static final String MESSAGE = System.getenv().getOrDefault("MESSAGE", "mensagem de teste");
+    private static final long SUBSCRIBE_MS = (long) (Double.parseDouble(
+            System.getenv().getOrDefault("SUBSCRIBE_SECONDS", "5")) * 1000);
+    private static final int RECV_TIMEOUT_MS = Integer.parseInt(
+            System.getenv().getOrDefault("RECV_TIMEOUT_MS", "5000"));
+    private static final long BOT_DELAY_MS = (long) (Double.parseDouble(
+            System.getenv().getOrDefault("BOT_DELAY_SECONDS", "1")) * 1000);
+    private static long logicalClock = 0;
 
     public static void main(String[] args) {
-        if ("SUBSCRIBE".equals(ACTION)) {
-            runSubscribe();
-            return;
+        try (ZContext context = new ZContext()) {
+            if ("SUBSCRIBE".equals(ACTION)) {
+                runSubscribe(context, parseChannels(CHANNELS_ENV), SUBSCRIBE_MS);
+            } else if ("BOT".equals(ACTION) || "BOT_LOOP".equals(ACTION)) {
+                runBotLoop(context);
+            } else {
+                runOneShot(context);
+            }
+        } catch (Exception e) {
+            System.err.println("[CLIENT] Erro: " + e.getMessage());
+            e.printStackTrace();
+            System.exit(1);
         }
+    }
 
-        try (ZContext ctx = new ZContext()) {
-            ZMQ.Socket socket = ctx.createSocket(SocketType.REQ);
+    private static void runOneShot(ZContext context) throws Exception {
+        try (ZMQ.Socket socket = context.createSocket(SocketType.REQ)) {
             socket.setReceiveTimeOut(RECV_TIMEOUT_MS);
             socket.setLinger(0);
             socket.connect(SERVER_ADDRESS);
-            System.out.printf("[CLIENT] '%s' conectando em %s (ACTION=%s)%n", BOT_NAME, SERVER_ADDRESS, ACTION);
-
             Map<String, Object> request = buildRequest();
-            byte[] raw = MAPPER.writeValueAsBytes(request);
-            socket.send(raw, 0);
-            System.out.println("[SEND] " + request);
-
-            byte[] replyRaw = socket.recv(0);
-            if (replyRaw == null) {
-                System.out.println("[CLIENT] Timeout: servidor nao respondeu dentro do prazo");
-                System.exit(1);
-                return;
-            }
-
-            @SuppressWarnings("unchecked")
-            Map<String, Object> response = MAPPER.readValue(replyRaw, Map.class);
-            System.out.println("[RECV] " + response);
+            Map<String, Object> response = exchange(socket, request);
             printResult(response);
-        } catch (Exception e) {
-            System.err.println("[CLIENT] Erro: " + e.getMessage());
-            e.printStackTrace();
-            System.exit(1);
         }
     }
 
-    /**
-     * ACTION=SUBSCRIBE: conecta direto no broker (nao no servidor),
-     * assina CHANNEL_NAME e escuta por SUBSCRIBE_SECONDS antes de sair.
-     * Fluxo totalmente separado do REQ/REP usado pelas outras acoes.
-     */
-    private static void runSubscribe() {
-        try (ZContext ctx = new ZContext()) {
-            ZMQ.Socket sub = ctx.createSocket(SocketType.SUB);
-            sub.connect(BROKER_ADDRESS);
-            sub.subscribe(CHANNEL_NAME.getBytes("UTF-8"));
-            sub.setReceiveTimeOut(500);
-            System.out.printf(
-                    "[CLIENT] '%s' assinando canal '%s' em %s por %.1fs%n",
-                    BOT_NAME, CHANNEL_NAME, BROKER_ADDRESS, SUBSCRIBE_SECONDS);
+    private static void runBotLoop(ZContext context) throws Exception {
+        try (ZMQ.Socket req = context.createSocket(SocketType.REQ)) {
+            req.setReceiveTimeOut(RECV_TIMEOUT_MS);
+            req.setLinger(0);
+            req.connect(SERVER_ADDRESS);
+            Map<String, Object> login = exchange(req,
+                    buildEnvelope("LOGIN_REQUEST", Map.of("bot_name", BOT_NAME)));
+            if (!isOk(login)) throw new IllegalStateException("login recusado");
 
+            List<String> channels = requestChannels(req);
+            String safeName = BOT_NAME.toLowerCase().replaceAll("[^a-z0-9_-]", "-");
+            if (safeName.length() > 30) safeName = safeName.substring(0, 30);
+            int attempt = 0;
+            // Com o broker REQ/REP (round-robin) a listagem e a criacao podem cair em
+            // servidores diferentes; por isso tambem contamos os canais que ESTE bot criou.
+            Set<String> createdNames = new HashSet<>();
+            while (knownCount(channels, createdNames) < 5 && attempt < 20) {
+                String name = "canal-" + safeName + "-" + (attempt + 1);
+                Map<String, Object> created = exchange(req, buildEnvelope("CHANNEL_CREATE_REQUEST",
+                        Map.of("channel_name", name, "bot_name", BOT_NAME)));
+                if (isOk(created)) {
+                    createdNames.add(name);
+                } else {
+                    System.out.println("[CLIENT] canal não criado: " + error(created));
+                }
+                channels = requestChannels(req);
+                attempt++;
+            }
+            if (channels.isEmpty()) channels = new ArrayList<>(createdNames);
+            if (channels.isEmpty()) throw new IllegalStateException("servidor sem canais");
+
+            List<String> shuffled = new ArrayList<>(channels);
+            Collections.shuffle(shuffled);
+            List<String> subscribed = shuffled.subList(0, Math.min(3, shuffled.size()));
+            Thread subscriber = new Thread(() -> runSubscribe(context, subscribed, -1), "vetflow-subscriber-" + BOT_NAME);
+            subscriber.setDaemon(true);
+            subscriber.start();
+
+            Random random = new Random();
+            while (true) {
+                List<String> fresh = requestChannels(req); // canais de outros bots entram no sorteio
+                if (!fresh.isEmpty()) channels = fresh;
+                String channel = channels.get(random.nextInt(channels.size()));
+                for (int i = 1; i <= 10; i++) {
+                    String message = BOT_NAME + ": mensagem " + i + " no canal " + channel;
+                    Map<String, Object> response = exchange(req, buildEnvelope("PUBLISH_REQUEST",
+                            Map.of("channel_name", channel, "message", message)));
+                    if (!isOk(response)) System.out.println("[CLIENT] publicação recusada: " + error(response));
+                    Thread.sleep(BOT_DELAY_MS);
+                }
+            }
+        }
+    }
+
+    private static int knownCount(List<String> channels, Set<String> created) {
+        Set<String> all = new HashSet<>(channels);
+        all.addAll(created);
+        return all.size();
+    }
+
+    private static List<String> requestChannels(ZMQ.Socket req) throws Exception {
+        Map<String, Object> response = exchange(req, buildEnvelope("CHANNEL_LIST_REQUEST", new LinkedHashMap<>()));
+        Object raw = ((Map<?, ?>) response.get("payload")).get("channels");
+        List<String> channels = new ArrayList<>();
+        if (raw instanceof List<?>) {
+            for (Object item : (List<?>) raw) if (item instanceof String) channels.add((String) item);
+        }
+        return channels;
+    }
+
+    private static void runSubscribe(ZContext context, List<String> channels, long durationMs) {
+        try (ZMQ.Socket sub = context.createSocket(SocketType.SUB)) {
+            sub.connect(BROKER_ADDRESS);
+            for (String channel : channels) sub.subscribe(channel.getBytes("UTF-8"));
+            sub.setReceiveTimeOut(300);
+            System.out.println("[CLIENT] '" + BOT_NAME + "' inscrito nos canais " + channels);
+            long deadline = durationMs < 0 ? Long.MAX_VALUE : System.currentTimeMillis() + durationMs;
             int received = 0;
-            long deadline = System.currentTimeMillis() + (long) (SUBSCRIBE_SECONDS * 1000);
             while (System.currentTimeMillis() < deadline) {
                 byte[] topic = sub.recv(0);
-                if (topic == null) {
-                    continue; // timeout de 500ms, tenta de novo ate o deadline
-                }
+                if (topic == null) continue;
                 byte[] body = sub.hasReceiveMore() ? sub.recv(0) : null;
-                if (body == null) {
-                    continue;
-                }
+                if (body == null) continue;
                 @SuppressWarnings("unchecked")
                 Map<String, Object> envelope = MAPPER.readValue(body, Map.class);
-                System.out.printf("[RECV] topico=%s envelope=%s%n", new String(topic, "UTF-8"), envelope);
+                observeMessage(envelope);
+                Map<?, ?> payload = (Map<?, ?>) envelope.get("payload");
+                System.out.printf("[PUBSUB-RECV] canal=%s mensagem=%s timestamp_envio=%s "
+                                + "timestamp_recebimento=%d logical_clock=%s%n",
+                        new String(topic, "UTF-8"), payload.get("message"), envelope.get("timestamp"),
+                        System.currentTimeMillis(), envelope.get("logical_clock"));
                 received++;
             }
-
-            System.out.println("[CLIENT] total de mensagens recebidas: " + received);
+            if (durationMs >= 0) System.out.println("[CLIENT] total de mensagens recebidas: " + received);
         } catch (Exception e) {
-            System.err.println("[CLIENT] Erro: " + e.getMessage());
-            e.printStackTrace();
-            System.exit(1);
+            if (durationMs >= 0) System.err.println("[CLIENT] subscriber: " + e.getMessage());
         }
     }
 
-    private static Map<String, Object> buildEnvelope(String type, Map<String, Object> payload) {
+    private static Map<String, Object> exchange(ZMQ.Socket socket, Map<String, Object> request) throws Exception {
+        System.out.println("[SEND] " + request);
+        socket.send(MAPPER.writeValueAsBytes(request), 0);
+        byte[] raw = socket.recv(0);
+        if (raw == null) throw new IllegalStateException("servidor não respondeu no prazo");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> response = MAPPER.readValue(raw, Map.class);
+        observeMessage(response);
+        System.out.println("[RECV] " + response);
+        return response;
+    }
+
+    private static synchronized Map<String, Object> buildEnvelope(String type, Map<String, Object> payload) {
+        logicalClock++;
         Map<String, Object> envelope = new LinkedHashMap<>();
         envelope.put("type", type);
         envelope.put("sender_id", BOT_NAME);
         envelope.put("sender_lang", "java");
         envelope.put("timestamp", System.currentTimeMillis());
+        envelope.put("logical_clock", logicalClock);
         envelope.put("payload", payload);
         return envelope;
     }
 
+    private static synchronized void observeMessage(Map<String, Object> envelope) {
+        Object value = envelope.get("logical_clock");
+        if (value instanceof Number) logicalClock = Math.max(logicalClock, ((Number) value).longValue());
+    }
+
     private static Map<String, Object> buildRequest() {
+        Map<String, Object> payload = new LinkedHashMap<>();
         switch (ACTION) {
-            case "LOGIN": {
-                Map<String, Object> payload = new LinkedHashMap<>();
+            case "LOGIN":
                 payload.put("bot_name", BOT_NAME);
                 return buildEnvelope("LOGIN_REQUEST", payload);
-            }
-            case "CHANNEL_CREATE": {
-                Map<String, Object> payload = new LinkedHashMap<>();
+            case "CHANNEL_CREATE":
                 payload.put("channel_name", CHANNEL_NAME);
                 payload.put("bot_name", BOT_NAME);
                 return buildEnvelope("CHANNEL_CREATE_REQUEST", payload);
-            }
-            case "CHANNEL_LIST": {
-                return buildEnvelope("CHANNEL_LIST_REQUEST", new LinkedHashMap<>());
-            }
-            case "PUBLISH": {
-                Map<String, Object> payload = new LinkedHashMap<>();
+            case "CHANNEL_LIST":
+                return buildEnvelope("CHANNEL_LIST_REQUEST", payload);
+            case "PUBLISH":
                 payload.put("channel_name", CHANNEL_NAME);
                 payload.put("message", MESSAGE);
                 return buildEnvelope("PUBLISH_REQUEST", payload);
-            }
             default:
-                System.out.println("[CLIENT] ACTION desconhecida: '" + ACTION + "'");
-                System.exit(1);
-                return null; // inalcancavel
+                throw new IllegalArgumentException("ACTION desconhecida: " + ACTION);
         }
     }
 
-    @SuppressWarnings("unchecked")
+    private static List<String> parseChannels(String value) {
+        List<String> channels = new ArrayList<>();
+        for (String channel : value.split(",")) if (!channel.trim().isEmpty()) channels.add(channel.trim());
+        return channels;
+    }
+
+    private static boolean isOk(Map<String, Object> response) {
+        Object payload = response.get("payload");
+        return payload instanceof Map<?, ?> && "OK".equals(((Map<?, ?>) payload).get("status"));
+    }
+
+    private static String error(Map<String, Object> response) {
+        Object payload = response.get("payload");
+        return payload instanceof Map<?, ?> ? String.valueOf(((Map<?, ?>) payload).get("error_msg")) : "resposta inválida";
+    }
+
     private static void printResult(Map<String, Object> response) {
-        String type = (String) response.get("type");
-        Map<String, Object> payload = (Map<String, Object>) response.get("payload");
-
-        if ("CHANNEL_LIST_RESPONSE".equals(type)) {
-            Object channels = payload.get("channels");
-            System.out.println("[CLIENT] Canais existentes: " + channels);
-            return;
-        }
-
-        if ("OK".equals(payload.get("status"))) {
-            System.out.println("[CLIENT] Acao '" + ACTION + "' concluida com sucesso.");
+        if ("CHANNEL_LIST_RESPONSE".equals(response.get("type"))) {
+            System.out.println("[CLIENT] Canais existentes: "
+                    + ((Map<?, ?>) response.get("payload")).get("channels"));
+        } else if (!isOk(response)) {
+            throw new IllegalStateException(error(response));
         } else {
-            System.out.println("[CLIENT] Acao '" + ACTION + "' falhou: " + payload.get("error_msg"));
-            System.exit(1);
+            System.out.println("[CLIENT] ação concluída com sucesso");
         }
     }
 }

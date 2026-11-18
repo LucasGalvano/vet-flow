@@ -65,6 +65,12 @@ def _load_list(path: str) -> list:
     try:
         data = msgpack.unpackb(raw, raw=False)
     except (msgpack.exceptions.UnpackException, ValueError):
+        # Preserva o arquivo ruim para analise: sem isso, a proxima escrita
+        # sobrescreveria o historico inteiro com uma lista quase vazia.
+        try:
+            os.replace(path, path + ".corrupt")
+        except OSError:
+            pass
         # Arquivo corrompido/truncado: nao derruba o servidor, apenas
         # comeca com lista vazia. Decisao conservadora para nao
         # bloquear a demonstracao por causa de um arquivo ruim.
@@ -77,8 +83,14 @@ def _save_list(items: list, path: str) -> None:
     """Regrava o arquivo inteiro com a lista atual de itens."""
     _ensure_parent_dir(path)
     packed = msgpack.packb(items, use_bin_type=True)
-    with open(path, "wb") as f:
+    # Escrita atomica: grava em arquivo temporario e troca por rename, para que
+    # uma queda no meio da escrita nunca deixe o arquivo real truncado.
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "wb") as f:
         f.write(packed)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
 
 
 def _append_item(record: dict, path: str) -> list:
